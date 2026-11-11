@@ -593,6 +593,8 @@ interface Declaration {
   type: string;
   length: number;
   location: number | null;
+  /** Declared with `[n]`, even `[1]`: a browser lists it as `name[0]`, which a library reads to tell an array from a single value. */
+  array?: boolean;
 }
 
 interface UniformCall {
@@ -695,7 +697,7 @@ function declarations(source: string, keywords: string[]): Declaration[] {
         out.push(...uniformLeaves(d[1]!, m[3]!, d[2] === undefined ? null : length, structs));
         continue;
       }
-      out.push({ name: d[1]!, type: m[3]!, length, location: location ? Number(location[1]) : null });
+      out.push({ name: d[1]!, type: m[3]!, length, location: location ? Number(location[1]) : null, ...(d[2] === undefined ? {} : { array: true }) });
     }
   }
   return out;
@@ -1887,7 +1889,7 @@ export class WebGLContext {
   }
   getActiveUniform(program: WebGLProgram, index: number): WebGLActiveInfo | null {
     const d = program.uniformDeclarations[index];
-    return d === undefined ? null : new WebGLActiveInfo(d.length > 1 ? `${d.name}[0]` : d.name, d.length, TYPE_CODES[d.type] ?? 0);
+    return d === undefined ? null : new WebGLActiveInfo(d.length > 1 || d.array ? `${d.name}[0]` : d.name, d.length, TYPE_CODES[d.type] ?? 0);
   }
   getUniformLocation(program: WebGLProgram, name: string): WebGLUniformLocation | null {
     // A struct field is named in full (`lights[1].color`); an array element is the array and an index.
