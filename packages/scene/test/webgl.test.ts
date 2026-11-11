@@ -238,6 +238,19 @@ describe('the recording WebGL context', () => {
     for (let unit = 0; unit < 16; unit += 1) expect(constants[`TEXTURE${unit}`]).toBe(GL.TEXTURE0 + unit);
   });
 
+  it('reads the declarations after a prelude that tests GL_ES and defined()', () => {
+    const gl = createWebGLContext({ size: () => ({ width: 8, height: 4 }) });
+    const program = gl.createProgram();
+    const prelude = '#ifdef GL_ES\nprecision mediump float;\n#else\n#if !defined(lowp)\n#define lowp\n#endif\nuniform float desktop_only;\n#endif\n#ifdef GL_FRAGMENT_PRECISION_HIGH\nuniform float high;\n#endif\n';
+    for (const [type, source] of [[GL.VERTEX_SHADER, VERTEX], [GL.FRAGMENT_SHADER, `${prelude}uniform float t; void main() { gl_FragColor = vec4(t); }`]] as const) {
+      const shader = gl.createShader(type)!;
+      gl.shaderSource(shader, source);
+      gl.attachShader(program, shader);
+    }
+    gl.linkProgram(program);
+    expect(Array.from({ length: gl.getProgramParameter(program, GL.ACTIVE_UNIFORMS) as number }, (_, i) => gl.getActiveUniform(program, i)!.name)).toEqual(['high', 't']);
+  });
+
   it('says unsupported, naming what to do, for what it does not draw', () => {
     const { gl } = setup();
     const refused = (fn: () => void): string => {
