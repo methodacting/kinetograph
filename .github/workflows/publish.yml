@@ -66,7 +66,7 @@ jobs:
           github-token: ${{ github.token }}
 
       # napi-rs's own steps: `artifacts` puts each .node into its platform package (npm/<platform>) and fails if one of
-      # the three is missing; `pre-publish` writes optionalDependencies into the root package.json. The platform
+      # the four is missing; `pre-publish` writes optionalDependencies into the root package.json. The platform
       # packages are published below, in the same job, not by napi (--skip-optional-publish), and no GitHub release is
       # made (--no-gh-release).
       - name: Assemble the native packages
@@ -76,13 +76,13 @@ jobs:
           # The GPL ffmpeg program of each platform (bin/ffmpeg, bin/SOURCES.txt) rides in the same artifact; artifacts
           # lose the executable bit.
           # Only the expected files are taken from each artifact, by name.
-          for p in darwin-arm64 linux-x64-gnu win32-x64-msvc; do
+          for p in darwin-arm64 darwin-x64 linux-x64-gnu win32-x64-msvc; do
             a=artifacts/bindings-$p/npm/$p/bin
             mkdir -p "npm/$p/bin"
             exe=ffmpeg; if [ "$p" = win32-x64-msvc ]; then exe=ffmpeg.exe; fi
             cp "$a/$exe" "$a/SOURCES.txt" "npm/$p/bin/"
           done
-          chmod +x npm/darwin-arm64/bin/ffmpeg npm/linux-x64-gnu/bin/ffmpeg
+          chmod +x npm/darwin-arm64/bin/ffmpeg npm/darwin-x64/bin/ffmpeg npm/linux-x64-gnu/bin/ffmpeg
           npm run legal
           npx napi pre-publish -t npm --skip-optional-publish --no-gh-release
           grep -A4 optionalDependencies package.json

@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const win = process.platform === 'win32';
-const platform = { 'darwin-arm64': 'darwin-arm64', 'linux-x64': 'linux-x64-gnu', 'win32-x64': 'win32-x64-msvc' }[`${process.platform}-${process.arch}`];
+const platform = { 'darwin-arm64': 'darwin-arm64', 'darwin-x64': 'darwin-x64', 'linux-x64': 'linux-x64-gnu', 'win32-x64': 'win32-x64-msvc' }[`${process.platform}-${process.arch}`];
 if (!platform) throw new Error(`no platform package for ${process.platform}-${process.arch}`);
 
 const npm = (args, cwd) => execFileSync('npm', args, { cwd, encoding: 'utf8', shell: win, stdio: ['ignore', 'pipe', 'inherit'] });
