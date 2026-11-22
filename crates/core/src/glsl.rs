@@ -1102,14 +1102,20 @@ fn rewrite(input: RewriteInput<'_>) -> std::result::Result<Rewritten, String> {
             let name = directive.trim_start();
             defines.directive(name)?;
             let keyword = name.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
+            let macro_name = name[keyword.len()..].trim_start();
+            let macro_name = &macro_name[..macro_name
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(macro_name.len())];
             if matches!(
                 keyword,
                 "version" | "extension" | "if" | "ifdef" | "ifndef" | "elif" | "else" | "endif"
             ) || !defines.active()
+                || (matches!(keyword, "define" | "undef") && QUALIFIERS.contains(&macro_name))
             {
                 // Removed, keeping the lines. The conditionals are decided here, with `defined` and `GL_ES`
                 // as a GLSL ES compiler has them: the lines a branch leaves out are not given on, so naga's own
                 // preprocessor (which reads neither) never sees one, and neither does a `#define` of such a line.
+                // A macro named as a qualifier is applied here (`expand_qualifiers`), so naga never has it.
                 body.push_str(&"\n".repeat(extra));
             } else {
                 body.push_str(&rewrite_directive(
@@ -1125,7 +1131,7 @@ fn rewrite(input: RewriteInput<'_>) -> std::result::Result<Rewritten, String> {
         }
         // What a conditional leaves out is not read for declarations (naga drops it as well).
         if defines.active() {
-            chunk.push_str(line);
+            chunk.push_str(&expand_qualifiers(line, &defines));
         }
         chunk.push('\n');
         index += 1;
@@ -1388,6 +1394,47 @@ fn blank_qualifiers(code: &str) -> String {
             out.replace_range(at..at + 5, "     ");
         }
     }
+    out
+}
+
+/// `line` with each qualifier that names a macro replaced by what it expands to, as a GLSL ES compiler reads it. A
+/// WebGL 1 build of a GLSL ES 3.00 shader writes `in` and `out` and defines them (Pixi: `#define in attribute`,
+/// `#define out varying`). The rewrite reads the qualifiers to move a declaration and writes its own `in` and `out`,
+/// which naga's preprocessor would expand again into words it refuses; so these macros are applied here, and their
+/// `#define` is not given to naga.
+fn expand_qualifiers(line: &str, defines: &Cpp) -> String {
+    let mut out = String::new();
+    let mut last = 0;
+    for t in tokenize(line) {
+        let w = &line[t.start..t.end];
+        if t.kind == Kind::Ident && QUALIFIERS.contains(&w) && defines.object(w).is_some() {
+            out.push_str(&line[last..t.start]);
+            out.push_str(&expand_macro(w, defines, &mut Vec::new()));
+            last = t.end;
+        }
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
+/// What `name` expands to: the value of the macro, with the macros in it expanded in turn. A macro is not expanded
+/// inside its own expansion (`hiding`), as in C.
+fn expand_macro(name: &str, defines: &Cpp, hiding: &mut Vec<String>) -> String {
+    let Some(value) = defines.object(name).filter(|_| !hiding.iter().any(|h| h == name)) else {
+        return name.to_string();
+    };
+    hiding.push(name.to_string());
+    let mut out = String::new();
+    let mut last = 0;
+    for t in tokenize(value) {
+        if t.kind == Kind::Ident {
+            out.push_str(&value[last..t.start]);
+            out.push_str(&expand_macro(&value[t.start..t.end], defines, hiding));
+            last = t.end;
+        }
+    }
+    out.push_str(&value[last..]);
+    hiding.pop();
     out
 }
 
@@ -3503,6 +3550,30 @@ mod tests {
         assert!(t.fragment.module.entry_points.len() == 1);
         // An error in a branch that is left out is not read.
         translate(&program(QUAD_ES1, "#if 0\nthis is not GLSL\n#endif\nvoid main() { gl_FragColor = vec4(1.0); }")).unwrap();
+    }
+
+    #[test]
+    fn a_macro_named_as_a_qualifier_is_applied_before_the_declarations_are_read() {
+        // Pixi's WebGL 1 build of a GLSL ES 3.00 shader: the storage words are macros, and so are the output and the
+        // sampling function.
+        let t = translate(&program(
+            "#ifdef GL_ES\n#define in attribute\n#define out varying\n#endif\n\
+             in vec2 a_pos; out vec2 v_uv;\n\
+             void main() { v_uv = a_pos; gl_Position = vec4(a_pos, 0.0, 1.0); }",
+            "#ifdef GL_ES\n#define in varying\n#define finalColor gl_FragColor\n#define texture texture2D\n#endif\n\
+             precision mediump float; in vec2 v_uv; uniform sampler2D u_tex;\n\
+             void main() { finalColor = texture(u_tex, v_uv); }",
+        ))
+        .unwrap();
+        assert_eq!(t.vertex.attributes, vec![("a_pos".into(), 0, Some(AttrKind::Float(2)))]);
+        assert_eq!(t.samplers.len(), 1);
+        // A macro undefined again is not applied: this `out` is the fragment shader's output, not a varying.
+        translate(&program(
+            "#version 300 es\nin vec2 a_pos; out vec2 v_uv;\nvoid main() { v_uv = a_pos; gl_Position = vec4(a_pos, 0.0, 1.0); }",
+            "#version 300 es\n#define out varying\n#undef out\n\
+             precision highp float; in vec2 v_uv; out vec4 o; void main() { o = vec4(v_uv, 0.0, 1.0); }",
+        ))
+        .unwrap();
     }
 
     const FRAGMENT_ES3: &str = "#version 300 es\nprecision highp float; out vec4 o; void main() { o = vec4(1.0); }";

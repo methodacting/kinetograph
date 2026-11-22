@@ -112,6 +112,14 @@ impl Cpp {
         Ok(())
     }
 
+    /// The value of `name`, if it is a macro without parameters.
+    pub fn object(&self, name: &str) -> Option<&str> {
+        self.macros
+            .get(name)
+            .filter(|m| !m.function_like)
+            .map(|m| m.value.as_str())
+    }
+
     /// An array length as written: its value when it is an integer expression of numbers and macros, else the text.
     pub fn length(&self, written: &str) -> String {
         match self.calc_at(written, 0, true) {
