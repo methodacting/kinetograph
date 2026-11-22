@@ -268,6 +268,10 @@ jobs:
   smoke:
     name: smoke (${{ matrix.platform }})
     needs: build
+    # Fork only: each platform smokes its own artifact even when another platform's build failed (v0.4.0-rc.1's
+    # ONNX Runtime URL is gone from GitHub, which fails the rows that download it). A row whose build failed fails at
+    # its download.
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
     # Windows runners have no GPU and no Vulkan driver: wgpu uses Direct3D 12 (WARP) and Skia draws on the CPU.
     continue-on-error: ${{ matrix.allow_fail }}
