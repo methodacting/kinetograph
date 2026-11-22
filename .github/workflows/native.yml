@@ -5,7 +5,8 @@ name: native
 on:
   # main only: a branch is built through its pull request, so a push to one does not build twice.
   push:
-    branches: [main]
+    # ci/darwin-x64: fork only, so that the fork registers this workflow (it had never run one); drop before upstreaming.
+    branches: [main, ci/darwin-x64]
   pull_request:
   workflow_dispatch:
 
