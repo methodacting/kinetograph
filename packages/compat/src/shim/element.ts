@@ -417,6 +417,31 @@ export class DomNodeBase {
   get ownerDocument(): unknown {
     return ownerDocumentOf((this as unknown as { host: DomNode }).host);
   }
+  // The tree links are `Node`'s too: Svelte's runtime takes the `firstChild` and `nextSibling` getters from
+  // `Node.prototype` once and calls them on every node. Each kind of node gives its own lists.
+  get childNodes(): NodeList<DomElement | DomText> {
+    return nodeListOf([]);
+  }
+  get firstChild(): DomElement | DomText | null {
+    return this.childNodes[0] ?? null;
+  }
+  get lastChild(): DomElement | DomText | null {
+    return this.childNodes.at(-1) ?? null;
+  }
+  /** The nodes next to this one (its parent's children), itself included; a node in no list has none. */
+  protected siblingHosts(): DomNode[] {
+    return [];
+  }
+  get nextSibling(): DomElement | DomText | null {
+    const list = this.siblingHosts();
+    const next = list[list.indexOf((this as unknown as { host: DomNode }).host) + 1];
+    return next === undefined ? null : domNodeFor(next);
+  }
+  get previousSibling(): DomElement | DomText | null {
+    const list = this.siblingHosts();
+    const at = list.indexOf((this as unknown as { host: DomNode }).host);
+    return at <= 0 ? null : domNodeFor(list[at - 1]!);
+  }
 }
 
 /** The events a page that waits for a user gesture listens for, and the elements that have such a listener (`doctor`). */
@@ -708,12 +733,6 @@ export class DomElement extends DomNodeBase {
   get childElementCount(): number {
     return this.children.length;
   }
-  get firstChild(): DomElement | DomText | null {
-    return this.childNodes[0] ?? null;
-  }
-  get lastChild(): DomElement | DomText | null {
-    return this.childNodes.at(-1) ?? null;
-  }
   get firstElementChild(): DomElement | null {
     return this.children[0] ?? null;
   }
@@ -724,21 +743,11 @@ export class DomElement extends DomNodeBase {
     return this.childHosts().length > 0;
   }
   /** The nodes next to this one (its parent's children), text included. */
-  private siblingHosts(): DomNode[] {
+  protected override siblingHosts(): DomNode[] {
     const parent = effectiveParentOf(this.host);
     if (parent !== null) return this.readback.childNodes(parent);
     if (this.host === headHost || this.host === bodyHost) return [headHost, bodyHost];
     return this.readback.roots().filter((n) => n.kind === 'text' || isDomElement(n.type));
-  }
-  get nextSibling(): DomElement | DomText | null {
-    const list = this.siblingHosts();
-    const next = list[list.indexOf(this.host) + 1];
-    return next === undefined ? null : domNodeFor(next);
-  }
-  get previousSibling(): DomElement | DomText | null {
-    const list = this.siblingHosts();
-    const at = list.indexOf(this.host);
-    return at <= 0 ? null : domNodeFor(list[at - 1]!);
   }
   get nextElementSibling(): DomElement | null {
     const list = this.siblingHosts();
@@ -1986,15 +1995,6 @@ export class DomText extends DomNodeBase {
   hasChildNodes(): boolean {
     return false;
   }
-  get childNodes(): NodeList<DomElement | DomText> {
-    return nodeListOf([]);
-  }
-  get firstChild(): null {
-    return null;
-  }
-  get lastChild(): null {
-    return null;
-  }
   normalize(): void {}
   get data(): string {
     return this.host.text;
@@ -2034,19 +2034,9 @@ export class DomText extends DomNodeBase {
   get isConnected(): boolean {
     return isConnectedHost(this.host);
   }
-  private siblings(): DomNode[] {
+  protected override siblingHosts(): DomNode[] {
     const parent = this.parentHost();
     return parent === null ? [] : readbackOfHost(parent).childNodes(parent);
-  }
-  get nextSibling(): DomElement | DomText | null {
-    const list = this.siblings();
-    const next = list[list.indexOf(this.host) + 1];
-    return next === undefined ? null : domNodeFor(next);
-  }
-  get previousSibling(): DomElement | DomText | null {
-    const list = this.siblings();
-    const at = list.indexOf(this.host);
-    return at <= 0 ? null : domNodeFor(list[at - 1]!);
   }
   remove(): void {
     removeChild(this.host);
