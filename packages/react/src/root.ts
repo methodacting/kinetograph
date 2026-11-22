@@ -74,7 +74,7 @@ function describeParent(type: string): string {
 
 function checkChild(parentType: string, child: HostNode): void {
   if (parentType === 'kg-text' || parentType === 'kg-text3d') {
-    if (child.kind !== 'text') {
+    if (child.kind === 'element') {
       throw new Error(`<${ELEMENT_NAMES[child.type] ?? child.type}> cannot be inside <Text>: <${ELEMENT_NAMES[parentType]}> takes only strings and numbers`);
     }
     return;

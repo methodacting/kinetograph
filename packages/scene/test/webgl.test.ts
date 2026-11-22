@@ -238,6 +238,80 @@ describe('the recording WebGL context', () => {
     for (let unit = 0; unit < 16; unit += 1) expect(constants[`TEXTURE${unit}`]).toBe(GL.TEXTURE0 + unit);
   });
 
+  it('reads the declarations after a prelude that tests GL_ES and defined()', () => {
+    const gl = createWebGLContext({ size: () => ({ width: 8, height: 4 }) });
+    const program = gl.createProgram();
+    const prelude = '#ifdef GL_ES\nprecision mediump float;\n#else\n#if !defined(lowp)\n#define lowp\n#endif\nuniform float desktop_only;\n#endif\n#ifdef GL_FRAGMENT_PRECISION_HIGH\nuniform float high;\n#endif\n';
+    for (const [type, source] of [[GL.VERTEX_SHADER, VERTEX], [GL.FRAGMENT_SHADER, `${prelude}uniform float t; void main() { gl_FragColor = vec4(t); }`]] as const) {
+      const shader = gl.createShader(type)!;
+      gl.shaderSource(shader, source);
+      gl.attachShader(program, shader);
+    }
+    gl.linkProgram(program);
+    expect(Array.from({ length: gl.getProgramParameter(program, GL.ACTIVE_UNIFORMS) as number }, (_, i) => gl.getActiveUniform(program, i)!.name)).toEqual(['high', 't']);
+  });
+
+  describe('integer vertex data', () => {
+    const attributes = (gl: WebGLContext) => {
+      const draw = gl.content().ops.find((o) => o.op === 'draw');
+      return draw !== undefined && 'attributes' in draw ? draw.attributes : {};
+    };
+    const page = () => {
+      const gl = createWebGLContext({ size: () => ({ width: 8, height: 4 }), version: 2 });
+      const program = gl.createProgram();
+      for (const [type, source] of [[GL.VERTEX_SHADER, '#version 300 es\nin vec2 p; in uvec4 joints; void main() { gl_Position = vec4(p, float(joints.x & 255u), 1.0); }'], [GL.FRAGMENT_SHADER, '#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1); }']] as const) {
+        const shader = gl.createShader(type)!;
+        gl.shaderSource(shader, source);
+        gl.attachShader(program, shader);
+      }
+      gl.bindAttribLocation(program, 0, 'p');
+      gl.bindAttribLocation(program, 1, 'joints');
+      gl.linkProgram(program);
+      gl.useProgram(program);
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(GL.ARRAY_BUFFER, buffer);
+      gl.bufferData(GL.ARRAY_BUFFER, new Int16Array([0, 0, 1, 0, 0, 1]), GL.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.enableVertexAttribArray(1);
+      return { gl, buffer };
+    };
+
+    it('records a non-normalised short array for a float attribute as it is, with the type for the renderer to convert', () => {
+      const { gl } = page();
+      gl.vertexAttribPointer(0, 2, GL.SHORT, false, 0, 0);
+      gl.vertexAttribIPointer(1, 4, GL.UNSIGNED_SHORT, 0, 0);
+      gl.drawArrays(GL.TRIANGLES, 0, 3);
+      expect(attributes(gl).p).toMatchObject({ size: 2, type: 'i16', normalized: false });
+      expect(attributes(gl).p).not.toHaveProperty('integer');
+    });
+
+    it('records vertexAttribIPointer as an integer attribute of any integer type, and refuses what it must', () => {
+      const { gl } = page();
+      for (const [type, name] of [[GL.BYTE, 'i8'], [GL.UNSIGNED_BYTE, 'u8'], [GL.SHORT, 'i16'], [GL.UNSIGNED_SHORT, 'u16'], [GL.INT, 'i32'], [GL.UNSIGNED_INT, 'u32']] as const) {
+        gl.vertexAttribIPointer(1, 3, type, 12, 4);
+        gl.drawArrays(GL.TRIANGLES, 0, 3);
+        expect(attributes(gl).joints).toMatchObject({ integer: true, size: 3, type: name, stride: 12, offset: 4, normalized: false });
+        gl.resetState();
+      }
+      gl.vertexAttribIPointer(1, 3, GL.FLOAT, 0, 0);
+      expect(gl.getError()).toBe(GL.INVALID_ENUM);
+      gl.vertexAttribIPointer(1, 5, GL.SHORT, 0, 0);
+      expect(gl.getError()).toBe(GL.INVALID_VALUE);
+      gl.bindBuffer(GL.ARRAY_BUFFER, null);
+      gl.vertexAttribIPointer(1, 2, GL.SHORT, 0, 0);
+      expect(gl.getError()).toBe(GL.INVALID_OPERATION);
+    });
+
+    it('a later vertexAttribPointer makes the attribute a float one again', () => {
+      const { gl } = page();
+      gl.vertexAttribIPointer(1, 4, GL.UNSIGNED_SHORT, 0, 0);
+      gl.vertexAttribPointer(1, 4, GL.UNSIGNED_SHORT, true, 0, 0);
+      gl.drawArrays(GL.TRIANGLES, 0, 3);
+      expect(attributes(gl).joints).toMatchObject({ type: 'u16', normalized: true });
+      expect(attributes(gl).joints).not.toHaveProperty('integer');
+    });
+  });
+
   it('says unsupported, naming what to do, for what it does not draw', () => {
     const { gl } = setup();
     const refused = (fn: () => void): string => {
@@ -1591,6 +1665,12 @@ describe('the recording WebGL context', () => {
     }
     const BODY = 'void main() { gl_Position = vec4(p, morphTargetInfluences[0], 1.0); }';
 
+    it('lists an array of one element as name[0], as a browser does, so a library sets it as an array', () => {
+      const { gl, program } = linked('#version 300 es\nin vec2 p;\nuniform sampler2D maps[1];\nuniform float single;\nvoid main() { gl_Position = vec4(p, single, 1.0); }');
+      expect([0, 1].map((i) => gl.getActiveUniform(program, i)!.name)).toEqual(['maps[0]', 'single']);
+      expect(gl.getUniformLocation(program, 'maps[0]')).not.toBeNull();
+    });
+
     it('reads the length from a #define, as three.js writes morphTargetInfluences', () => {
       const { gl, program } = linked(`#version 300 es\nin vec2 p;\n#define MORPHTARGETS_COUNT 4\n#ifdef USE_MORPHTARGETS\n#endif\nuniform float morphTargetInfluences[ MORPHTARGETS_COUNT ];\n${BODY}`);
       const info = gl.getActiveUniform(program, 0)!;
@@ -1692,7 +1772,7 @@ describe('the recording WebGL context', () => {
       expect(gl.getError()).toBe(GL.INVALID_VALUE);
       gl.vertexAttrib3fv(0, [1, 2]);
       expect(gl.getError()).toBe(GL.INVALID_VALUE);
-      expect(() => gl.vertexAttribI4i()).toThrow(/^unsupported:.*integer attributes/);
+      expect(() => gl.vertexAttribI4i()).toThrow(/^unsupported:.*current value of an integer attribute/);
     });
   });
 

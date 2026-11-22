@@ -179,6 +179,8 @@ export function buildIslandRequest(root: ElementNode, options: BuildOptions): Bu
         out.push({ kind: 'text', text: child.text });
         continue;
       }
+      // A comment is not drawn and takes no place in the paths.
+      if (child.kind === 'comment') continue;
       const path = `${parent}.${index++}`;
       if (isDomElement(child.type)) {
         out.push(element(child, path, insideSvg));

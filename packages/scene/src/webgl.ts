@@ -575,6 +575,8 @@ export class WebGLShaderPrecisionFormat {
 
 interface VertexAttribute {
   enabled: boolean;
+  /** Set by `vertexAttribIPointer`: the shader reads integers. */
+  integer: boolean;
   buffer: WebGLBuffer | null;
   size: number;
   type: number;
@@ -585,7 +587,7 @@ interface VertexAttribute {
 }
 
 function newAttribute(): VertexAttribute {
-  return { enabled: false, buffer: null, size: 4, type: GL.FLOAT, normalized: false, stride: 0, offset: 0, divisor: 0 };
+  return { enabled: false, integer: false, buffer: null, size: 4, type: GL.FLOAT, normalized: false, stride: 0, offset: 0, divisor: 0 };
 }
 
 interface Declaration {
@@ -593,6 +595,8 @@ interface Declaration {
   type: string;
   length: number;
   location: number | null;
+  /** Declared with `[n]`, even `[1]`: a browser lists it as `name[0]`, which a library reads to tell an array from a single value. */
+  array?: boolean;
 }
 
 interface UniformCall {
@@ -695,7 +699,7 @@ function declarations(source: string, keywords: string[]): Declaration[] {
         out.push(...uniformLeaves(d[1]!, m[3]!, d[2] === undefined ? null : length, structs));
         continue;
       }
-      out.push({ name: d[1]!, type: m[3]!, length, location: location ? Number(location[1]) : null });
+      out.push({ name: d[1]!, type: m[3]!, length, location: location ? Number(location[1]) : null, ...(d[2] === undefined ? {} : { array: true }) });
     }
   }
   return out;
@@ -1887,7 +1891,7 @@ export class WebGLContext {
   }
   getActiveUniform(program: WebGLProgram, index: number): WebGLActiveInfo | null {
     const d = program.uniformDeclarations[index];
-    return d === undefined ? null : new WebGLActiveInfo(d.length > 1 ? `${d.name}[0]` : d.name, d.length, TYPE_CODES[d.type] ?? 0);
+    return d === undefined ? null : new WebGLActiveInfo(d.length > 1 || d.array ? `${d.name}[0]` : d.name, d.length, TYPE_CODES[d.type] ?? 0);
   }
   getUniformLocation(program: WebGLProgram, name: string): WebGLUniformLocation | null {
     // A struct field is named in full (`lights[1].color`); an array element is the array and an index.
@@ -2106,10 +2110,16 @@ export class WebGLContext {
     const a = this.attribute(index);
     if (a === null) return;
     if (this.arrayBuffer === null) return this.fail(GL.INVALID_OPERATION);
-    Object.assign(a, { buffer: this.arrayBuffer, size, type, normalized: Boolean(normalized), stride, offset });
+    Object.assign(a, { buffer: this.arrayBuffer, integer: false, size, type, normalized: Boolean(normalized), stride, offset });
   }
-  vertexAttribIPointer(): never {
-    throw new WebGLUnsupportedError('integer attributes (vertexAttribIPointer); use float attributes');
+  /** WebGL 2's `vertexAttribPointer` for integer inputs (`ivecN`, `uvecN`): the values reach the shader as they are. */
+  vertexAttribIPointer(index: number, size: number, type: number, stride: number, offset: number): void {
+    const a = this.attribute(index);
+    if (a === null) return;
+    if (![GL.BYTE, GL.UNSIGNED_BYTE, GL.SHORT, GL.UNSIGNED_SHORT, GL.INT, GL.UNSIGNED_INT].includes(type as never)) return this.fail(GL.INVALID_ENUM);
+    if (!(size >= 1 && size <= 4) || !(stride >= 0) || !(offset >= 0)) return this.fail(GL.INVALID_VALUE);
+    if (this.arrayBuffer === null) return this.fail(GL.INVALID_OPERATION);
+    Object.assign(a, { buffer: this.arrayBuffer, integer: true, size, type, normalized: false, stride, offset });
   }
   vertexAttribDivisor(index: number, divisor: number): void {
     const a = this.attribute(index);
@@ -2147,7 +2157,7 @@ export class WebGLContext {
     this.vertexAttrib4f(index, x, count > 1 ? y : 0, count > 2 ? z : 0, count > 3 ? w : 1);
   }
   vertexAttribI4i(): never {
-    throw new WebGLUnsupportedError('integer attributes (vertexAttribI4i, vertexAttribI4ui and their v forms); use float attributes');
+    throw new WebGLUnsupportedError('the current value of an integer attribute (vertexAttribI4i, vertexAttribI4ui and their v forms); give the attribute an array (vertexAttribIPointer)');
   }
   vertexAttribI4iv(): never {
     return this.vertexAttribI4i();
@@ -3289,9 +3299,9 @@ export class WebGLContext {
       }
       if (a.buffer === null) continue;
       if (a.divisor >= 1 && named === 'points') throw new WebGLUnsupportedError('instanced attributes of points');
-      const type = ({ [GL.FLOAT]: 'f32', [GL.UNSIGNED_BYTE]: 'u8', [GL.BYTE]: 'i8', [GL.UNSIGNED_SHORT]: 'u16', [GL.SHORT]: 'i16' } as Record<number, GlslDraw['attributes'][string]['type']>)[a.type];
-      if (type === undefined) throw new WebGLUnsupportedError(`the attribute "${d.name}" has type 0x${a.type.toString(16)}; use FLOAT, or a normalised byte or short`);
-      draw.attributes[d.name] = { buffer: this.bufferId(a.buffer), size: a.size, type, normalized: a.normalized, stride: a.stride, offset: a.offset, ...(a.divisor >= 1 ? { divisor: a.divisor } : {}) };
+      const type = ({ [GL.FLOAT]: 'f32', [GL.UNSIGNED_BYTE]: 'u8', [GL.BYTE]: 'i8', [GL.UNSIGNED_SHORT]: 'u16', [GL.SHORT]: 'i16', [GL.INT]: 'i32', [GL.UNSIGNED_INT]: 'u32' } as Record<number, GlslDraw['attributes'][string]['type']>)[a.type];
+      if (type === undefined) throw new WebGLUnsupportedError(`the attribute "${d.name}" has type 0x${a.type.toString(16)}; use FLOAT, BYTE, UNSIGNED_BYTE, SHORT, UNSIGNED_SHORT, INT or UNSIGNED_INT`);
+      draw.attributes[d.name] = { buffer: this.bufferId(a.buffer), size: a.size, type, normalized: a.normalized, ...(a.integer ? { integer: true } : {}), stride: a.stride, offset: a.offset, ...(a.divisor >= 1 ? { divisor: a.divisor } : {}) };
     }
     if (indexed !== null) {
       const element = this.vao.element;

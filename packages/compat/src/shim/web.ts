@@ -9,17 +9,17 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolveObjectURL } from 'node:buffer';
 import { extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CANVAS_SOURCE, CanvasContext2D, CanvasGradient, CanvasPattern, ImageData, Path2D, WebGLContext, createGpu, GPU_GLOBALS, pictureOf, type CanvasPicture } from '@kinetographdev/scene';
+import { CANVAS_SOURCE, CanvasContext2D, CanvasGradient, CanvasPattern, ImageData, Path2D, GL, GL2, WebGLContext, createGpu, GPU_GLOBALS, pictureOf, type CanvasPicture } from '@kinetographdev/scene';
 import { resolveDocumentUrl, resolveProjectFile, resolveCachedRemoteFile, sameOriginPath } from '../environment.js';
 import { OffscreenCanvasShim, rasterizeCanvas, webgpuDeviceInfo } from './canvas.js';
-import { DOMParserShim, DocumentShim, HTMLFormElementShim, HTMLTemplateElementShim, NodeFilterShim, NodeIteratorShim, TreeWalkerShim, XMLSerializerShim, installDocumentMembers } from './document.js';
+import { DOMParserShim, DocumentShim, HTMLFormElementShim, HTMLIFrameElementShim, HTMLTemplateElementShim, NodeFilterShim, NodeIteratorShim, TreeWalkerShim, XMLSerializerShim, installDocumentMembers } from './document.js';
 import { AttrShim, NamedNodeMapShim } from './attributes.js';
-import { DomElement, DomFragment, DomNodeBase, DomText, domElementFor, domTextFor, isDomElementShim, selectorContextOf, setImagePictureReader, setImageSizeReader, setProjectFileResolver } from './element.js';
+import { DomCharacterData, DomComment, DomElement, DomFragment, DomNodeBase, DomText, domCommentFor, domElementFor, domTextFor, isDomElementShim, selectorContextOf, setImagePictureReader, setImageSizeReader, setProjectFileResolver } from './element.js';
 import { bodyHost, headHost, htmlHost, pageDocument, setPageViewport } from './host.js';
 import { collectionOf, HTMLCollection, NodeList, nodeListOf } from './lists.js';
 import { RangeShim } from './range.js';
 import { CSSRuleShim, CSSStyleDeclarationShim, CSSStyleSheetShim } from './stylesheet.js';
-import { createHostElement, createHostText } from './tree.js';
+import { createHostComment, createHostElement, createHostText } from './tree.js';
 import { imageSizeOfBytes } from './image-size.js';
 import { IntersectionObserverShim, MutationObserverShim, readbackRoots, ResizeObserverShim } from './observers.js';
 import { matches, queryAll } from './selector.js';
@@ -550,6 +550,17 @@ function defineGetter(target: Record<string, unknown>, name: string, get: () => 
   if (!(name in target)) Object.defineProperty(target, name, { get, configurable: true, enumerable: false });
 }
 
+/** `WebGLRenderingContext` (version 1) or `WebGL2RenderingContext` (2): `instanceof` asks the recorder's version, and the constants are static, as in a browser. */
+function webglGlobal(version: 1 | 2): typeof WebGLContext {
+  const constructor = class extends WebGLContext {
+    static [Symbol.hasInstance](value: unknown): boolean {
+      return value instanceof WebGLContext && value.version === version;
+    }
+  };
+  Object.defineProperty(constructor, 'name', { value: version === 1 ? 'WebGLRenderingContext' : 'WebGL2RenderingContext' });
+  return Object.assign(constructor, GL, version === 2 ? GL2 : {});
+}
+
 /** Puts `window`, `document`, `Image`, `matchMedia`, the observers and a project-files-only `fetch` on the global object. */
 export function installDomGlobals(): void {
   const g = globalThis as Record<string, unknown>;
@@ -606,8 +617,9 @@ export function installDomGlobals(): void {
   define(g, 'HTMLCanvasElement', DomElement);
   define(g, 'OffscreenCanvas', OffscreenCanvasShim);
   define(g, 'CanvasRenderingContext2D', CanvasContext2D);
-  define(g, 'WebGLRenderingContext', WebGLContext);
-  define(g, 'WebGL2RenderingContext', WebGLContext);
+  // One recorder, two constructors: a `getContext('webgl')` context is a WebGLRenderingContext and not a WebGL2RenderingContext, and the reverse.
+  define(g, 'WebGLRenderingContext', webglGlobal(1));
+  define(g, 'WebGL2RenderingContext', webglGlobal(2));
   // `navigator.gpu` records (packages/scene/src/webgpu.ts); the canvas's 'webgpu' context is made by `getContext`.
   for (const [name, value] of Object.entries(GPU_GLOBALS)) define(g, name, value);
   const navigator = (g.navigator ??= {}) as Record<string, unknown>;
@@ -625,6 +637,7 @@ export function installDomGlobals(): void {
   define(g, 'DocumentFragment', DomFragment);
   define(g, 'HTMLTemplateElement', HTMLTemplateElementShim);
   define(g, 'HTMLFormElement', HTMLFormElementShim);
+  define(g, 'HTMLIFrameElement', HTMLIFrameElementShim);
   define(g, 'NamedNodeMap', NamedNodeMapShim);
   define(g, 'Attr', AttrShim);
   define(g, 'NodeFilter', NodeFilterShim);
@@ -697,12 +710,15 @@ export function installDomGlobals(): void {
   define(doc, 'createElement', (tag: string) => domElementFor(createHostElement(String(tag))));
   define(doc, 'createElementNS', (ns: string, tag: string) => domElementFor(createHostElement(String(tag), String(ns) === 'http://www.w3.org/2000/svg')));
   define(doc, 'createTextNode', (text: string) => domTextFor(createHostText(String(text))));
+  define(doc, 'createComment', (data: string) => domCommentFor(createHostComment(String(data))));
   define(doc, 'createRange', () => new RangeShim());
   define(g, 'Range', RangeShim);
   define(g, 'CSSStyleSheet', CSSStyleSheetShim);
   define(g, 'CSSRule', CSSRuleShim);
   define(g, 'CSSStyleDeclaration', CSSStyleDeclarationShim);
+  define(g, 'CharacterData', DomCharacterData);
   define(g, 'Text', DomText);
+  define(g, 'Comment', DomComment);
   installDocumentMembers(doc, define);
   define(doc, 'getElementById', function (this: unknown, id: string) {
     return this instanceof DocumentShim ? this.getElementById(id) : (documentQuery(`#${CSS_ESCAPE(String(id))}`, true)[0] ?? null);

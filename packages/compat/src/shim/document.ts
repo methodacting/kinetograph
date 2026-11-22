@@ -2,15 +2,18 @@
 // `document.implementation.createHTMLDocument`, `NodeIterator`, `TreeWalker`, `NodeFilter`, `HTMLTemplateElement`
 // and `HTMLFormElement` (DOMPurify finds its document through them, so Mermaid, which sanitizes every label, needs all of
 // these). A parsed document is a host tree like any other, `html > head, body`, owned by a `DocumentShim`: its nodes are the
-// same `DomElement`s and `DomText`s, parsed by the same fragment parser `innerHTML` uses.
+// same `DomElement`s, `DomText`s and `DomComment`s, parsed by the same fragment parser `innerHTML` uses.
 
 import { parseHtmlFragment } from '../request/html.js';
 import type { DomNode } from '../types.js';
 import {
+  DomCharacterData,
+  DomComment,
   DomElement,
   DomFragment,
   DomNodeBase,
   DomText,
+  domCommentFor,
   domElementFor,
   domNodeFor,
   domTextFor,
@@ -24,7 +27,7 @@ import {
 import type { HostElement } from './host.js';
 import { setRawParent } from './host.js';
 import { collectionOf, nodeListOf, type HTMLCollection, type NodeList } from './lists.js';
-import { cloneHost, createHostElement, createHostText, removeChild, setRemovalHook } from './tree.js';
+import { cloneHost, createHostComment, createHostElement, createHostText, removeChild, setRemovalHook } from './tree.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -51,12 +54,12 @@ export const NodeFilterShim = {
 
 type Filter = ((node: any) => number) | { acceptNode(node: any): number } | null;
 
-/** A node as the walkers see it: elements, text, fragments and documents. */
-type Walked = DomElement | DomText | DocumentShim;
+/** A node as the walkers see it: elements, text, comments, fragments and documents. */
+type Walked = DomElement | DomCharacterData | DocumentShim;
 
 const kidsOf = (node: Walked): Walked[] => {
   if (node instanceof DocumentShim) return node.documentElement === null ? [] : [node.documentElement];
-  if (node instanceof DomText) return [];
+  if (node instanceof DomCharacterData) return [];
   return Array.from(node.childNodes);
 };
 const firstChildOf = (node: Walked): Walked | null => kidsOf(node)[0] ?? null;
@@ -424,6 +427,11 @@ export class DocumentShim extends DomNodeBase {
     setOwnerDocument(node.host, this);
     return node;
   }
+  createComment(data: string): DomComment {
+    const node = domCommentFor(createHostComment(String(data)));
+    setOwnerDocument(node.host, this);
+    return node;
+  }
   createDocumentFragment(): DomFragment {
     const fragment = new DomFragment();
     setOwnerDocument(fragment.host, this);
@@ -529,7 +537,8 @@ function parseHtmlDocument(markup: string): DocumentShim {
   const place = (node: DomNode): void => {
     if (!inBody) {
       if (node.kind === 'text' && node.text.trim() === '') return;
-      if (node.kind === 'element' && HEAD_ONLY.has(node.type)) return adopt(head, node);
+      // Before the body starts, a comment stays in the head, as the HTML parser's "in head" mode puts it.
+      if (node.kind === 'comment' || (node.kind === 'element' && HEAD_ONLY.has(node.type))) return adopt(head, node);
       inBody = true;
     }
     adopt(body, node);
@@ -594,7 +603,7 @@ export class XMLSerializerShim {
   }
 }
 
-/** `instanceof HTMLTemplateElement` and `HTMLFormElement` hold for an element of that tag. */
+/** `instanceof HTMLTemplateElement`, `HTMLFormElement` and `HTMLIFrameElement` hold for an element of that tag. */
 const tagClass = (tag: string): typeof DomElement =>
   class extends DomElement {
     static [Symbol.hasInstance](value: unknown): boolean {
@@ -603,6 +612,8 @@ const tagClass = (tag: string): typeof DomElement =>
   };
 export const HTMLTemplateElementShim = tagClass('template');
 export const HTMLFormElementShim = tagClass('form');
+// react-dom tests the focused element against it on every commit.
+export const HTMLIFrameElementShim = tagClass('iframe');
 
 let currentScript: DomElement | null = null;
 

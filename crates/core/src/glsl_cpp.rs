@@ -32,6 +32,8 @@ impl Cpp {
             open: Vec::new(),
         };
         cpp.define("GL_ES", false, "1");
+        // The fragment shader has highp, as the replay computes in 32-bit floats.
+        cpp.define("GL_FRAGMENT_PRECISION_HIGH", false, "1");
         cpp.define("__VERSION__", false, "100");
         cpp
     }
@@ -108,6 +110,14 @@ impl Cpp {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The value of `name`, if it is a macro without parameters.
+    pub fn object(&self, name: &str) -> Option<&str> {
+        self.macros
+            .get(name)
+            .filter(|m| !m.function_like)
+            .map(|m| m.value.as_str())
     }
 
     /// An array length as written: its value when it is an integer expression of numbers and macros, else the text.

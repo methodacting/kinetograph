@@ -2,19 +2,19 @@
 // the union of the boxes of the text and elements it covers, as the DOM engine lays them out. A piece of a text node is
 // measured by the root (`Readback.textRangeBox`); an element is its own box.
 
-import { DOMRectShim, DomElement, DomText, domNodeFor, hostNodeOf } from './element.js';
+import { DOMRectShim, DomElement, domNodeFor, hostNodeOf, type DomChildNode } from './element.js';
 import { bodyHost, effectiveParentOf, htmlHost, type Readback } from './host.js';
-import { isConnectedHost, readbackOfHost, type HostText } from './tree.js';
+import { characterDataOf, isConnectedHost, readbackOfHost, type HostText } from './tree.js';
 import { isDomElement } from '../request/tags.js';
 import type { DomNode } from '../types.js';
 
 type Boundary = { node: DomNode; offset: number };
 
-const lengthOf = (node: DomNode): number => (node.kind === 'text' ? node.text.length : readbackOfHost(node).childNodes(node).length);
+const lengthOf = (node: DomNode): number => (node.kind === 'element' ? readbackOfHost(node).childNodes(node).length : characterDataOf(node).length);
 
-/** The children of a node as a script sees them (text and DOM elements, `<Sequence>`s transparent). */
+/** The children of a node as a script sees them (text, comments and DOM elements, `<Sequence>`s transparent). */
 function childrenOf(node: DomNode): DomNode[] {
-  return node.kind === 'text' ? [] : readbackOfHost(node).childNodes(node);
+  return node.kind === 'element' ? readbackOfHost(node).childNodes(node) : [];
 }
 
 /** A node and everything under it, in document order. */
@@ -50,10 +50,10 @@ export class RangeShim {
   private endNode: DomNode = bodyHost;
   private endOffset_ = 0;
 
-  get startContainer(): DomElement | DomText {
+  get startContainer(): DomChildNode {
     return domNodeFor(this.startNode);
   }
-  get endContainer(): DomElement | DomText {
+  get endContainer(): DomChildNode {
     return domNodeFor(this.endNode);
   }
   get startOffset(): number {
@@ -65,7 +65,7 @@ export class RangeShim {
   get collapsed(): boolean {
     return this.startNode === this.endNode && this.startOffset_ === this.endOffset_;
   }
-  get commonAncestorContainer(): DomElement | DomText {
+  get commonAncestorContainer(): DomChildNode {
     const chain = (n: DomNode): DomNode[] => {
       const out: DomNode[] = [];
       for (let c: DomNode | null = n; c !== null; c = parentOfNode(c)) out.push(c);
@@ -159,7 +159,7 @@ export class RangeShim {
   private position(node: DomNode, offset: number): number {
     const root = this.topOf(node);
     const order = walk(root);
-    if (node.kind === 'text') return order.indexOf(node) + Math.min(offset / (node.text.length + 1), 0.999);
+    if (node.kind !== 'element') return order.indexOf(node) + Math.min(offset / (characterDataOf(node).length + 1), 0.999);
     // An element: before its `offset`th child, which is where that child's own walk position begins.
     const kids = childrenOf(node);
     if (offset < kids.length) return order.indexOf(kids[offset]!) - 0.5;

@@ -464,6 +464,27 @@ pub enum GlslType {
     I16,
     #[serde(rename = "u32")]
     U32,
+    #[serde(rename = "i32")]
+    I32,
+}
+
+impl GlslType {
+    /// The bytes of one value.
+    pub fn size(self) -> u64 {
+        match self {
+            GlslType::U8 | GlslType::I8 => 1,
+            GlslType::U16 | GlslType::I16 => 2,
+            GlslType::F32 | GlslType::U32 | GlslType::I32 => 4,
+        }
+    }
+}
+
+/// What a vertex shader input is, with its components: the value a draw must feed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttrKind {
+    Float(u32),
+    Int(u32),
+    Uint(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -475,6 +496,10 @@ pub struct GlslAttribute {
     pub ty: GlslType,
     #[serde(default)]
     pub normalized: bool,
+    /// `vertexAttribIPointer`: the shader reads the values as integers (`ivecN`, `uvecN`, `int`, `uint`); else as
+    /// floats, an integer type converted (or with `normalized`, scaled to 0..1, or -1..1 if signed).
+    #[serde(default)]
+    pub integer: bool,
     /// Bytes; 0 is tightly packed.
     #[serde(default)]
     pub stride: u32,
@@ -720,12 +745,18 @@ fn type_locations(ty: &str) -> Option<u32> {
 
 /// The float components of an attribute type, or `None` for a type a vertex
 /// buffer cannot feed.
-fn float_components(ty: &str) -> Option<u32> {
-    match ty {
-        "float" => Some(1),
-        "vec2" => Some(2),
-        "vec3" => Some(3),
-        "vec4" => Some(4),
+fn attribute_kind(ty: &str) -> Option<AttrKind> {
+    let (head, n) = match ty {
+        "float" => return Some(AttrKind::Float(1)),
+        "int" => return Some(AttrKind::Int(1)),
+        "uint" => return Some(AttrKind::Uint(1)),
+        _ => ty.split_at(ty.len().checked_sub(1)?),
+    };
+    let n: u32 = n.parse().ok().filter(|n| (2..=4).contains(n))?;
+    match head {
+        "vec" => Some(AttrKind::Float(n)),
+        "ivec" => Some(AttrKind::Int(n)),
+        "uvec" => Some(AttrKind::Uint(n)),
         _ => None,
     }
 }
@@ -927,7 +958,7 @@ struct Rewritten {
     /// they travel as `vec4`s.
     packed: Vec<PackedArray>,
     /// Attribute name, location, float components.
-    attributes: Vec<(String, u32, Option<u32>)>,
+    attributes: Vec<(String, u32, Option<AttrKind>)>,
     /// The `mat2`, `mat3` and `mat4` attributes: name, size and first location. Each is read as that many `vecN` columns.
     mat_attributes: Vec<(String, u32, u32)>,
     /// The varyings the fragment shader declares and the vertex shader does not write: an error if it reads one.
@@ -1070,8 +1101,21 @@ fn rewrite(input: RewriteInput<'_>) -> std::result::Result<Rewritten, String> {
             )?;
             let name = directive.trim_start();
             defines.directive(name)?;
-            if name.starts_with("version") || name.starts_with("extension") {
-                // Removed, keeping the lines.
+            let keyword = name.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
+            let macro_name = name[keyword.len()..].trim_start();
+            let macro_name = &macro_name[..macro_name
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(macro_name.len())];
+            if matches!(
+                keyword,
+                "version" | "extension" | "if" | "ifdef" | "ifndef" | "elif" | "else" | "endif"
+            ) || !defines.active()
+                || (matches!(keyword, "define" | "undef") && QUALIFIERS.contains(&macro_name))
+            {
+                // Removed, keeping the lines. The conditionals are decided here, with `defined` and `GL_ES`
+                // as a GLSL ES compiler has them: the lines a branch leaves out are not given on, so naga's own
+                // preprocessor (which reads neither) never sees one, and neither does a `#define` of such a line.
+                // A macro named as a qualifier is applied here (`expand_qualifiers`), so naga never has it.
                 body.push_str(&"\n".repeat(extra));
             } else {
                 body.push_str(&rewrite_directive(
@@ -1087,7 +1131,7 @@ fn rewrite(input: RewriteInput<'_>) -> std::result::Result<Rewritten, String> {
         }
         // What a conditional leaves out is not read for declarations (naga drops it as well).
         if defines.active() {
-            chunk.push_str(line);
+            chunk.push_str(&expand_qualifiers(line, &defines));
         }
         chunk.push('\n');
         index += 1;
@@ -1350,6 +1394,47 @@ fn blank_qualifiers(code: &str) -> String {
             out.replace_range(at..at + 5, "     ");
         }
     }
+    out
+}
+
+/// `line` with each qualifier that names a macro replaced by what it expands to, as a GLSL ES compiler reads it. A
+/// WebGL 1 build of a GLSL ES 3.00 shader writes `in` and `out` and defines them (Pixi: `#define in attribute`,
+/// `#define out varying`). The rewrite reads the qualifiers to move a declaration and writes its own `in` and `out`,
+/// which naga's preprocessor would expand again into words it refuses; so these macros are applied here, and their
+/// `#define` is not given to naga.
+fn expand_qualifiers(line: &str, defines: &Cpp) -> String {
+    let mut out = String::new();
+    let mut last = 0;
+    for t in tokenize(line) {
+        let w = &line[t.start..t.end];
+        if t.kind == Kind::Ident && QUALIFIERS.contains(&w) && defines.object(w).is_some() {
+            out.push_str(&line[last..t.start]);
+            out.push_str(&expand_macro(w, defines, &mut Vec::new()));
+            last = t.end;
+        }
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
+/// What `name` expands to: the value of the macro, with the macros in it expanded in turn. A macro is not expanded
+/// inside its own expansion (`hiding`), as in C.
+fn expand_macro(name: &str, defines: &Cpp, hiding: &mut Vec<String>) -> String {
+    let Some(value) = defines.object(name).filter(|_| !hiding.iter().any(|h| h == name)) else {
+        return name.to_string();
+    };
+    hiding.push(name.to_string());
+    let mut out = String::new();
+    let mut last = 0;
+    for t in tokenize(value) {
+        if t.kind == Kind::Ident {
+            out.push_str(&value[last..t.start]);
+            out.push_str(&expand_macro(&value[t.start..t.end], defines, hiding));
+            last = t.end;
+        }
+    }
+    out.push_str(&value[last..]);
+    hiding.pop();
     out
 }
 
@@ -1963,12 +2048,12 @@ fn declaration(
                     // A matrix cannot be a vertex input: its columns are, at consecutive locations, and the
                     // matrix is made of them at the start of `main`.
                     for column in 0..n {
-                        r.attributes.push((format!("{name}[{column}]"), at + column, Some(n)));
+                        r.attributes.push((format!("{name}[{column}]"), at + column, Some(AttrKind::Float(n))));
                     }
                     r.mat_attributes.push((name.clone(), n, at));
                     continue;
                 }
-                r.attributes.push((name.clone(), at, float_components(&ty)));
+                r.attributes.push((name.clone(), at, attribute_kind(&ty)));
                 text_out.push_str(&format!("layout(location={at}) in {ty} {name}; "));
             }
         }
@@ -2120,7 +2205,7 @@ pub struct Stage {
     pub uniform_size: u32,
     pub samplers: Vec<SamplerBinding>,
     /// Attribute name, location, float components.
-    pub attributes: Vec<(String, u32, Option<u32>)>,
+    pub attributes: Vec<(String, u32, Option<AttrKind>)>,
     /// The locations the fragment shader writes colour at (empty for the
     /// vertex stage).
     pub outputs: Vec<u32>,
@@ -2934,7 +3019,7 @@ mod tests {
              void main() { gl_FragColor = vec4(v_uv, 0.5 + 0.5 * sin(u_time), 1.0); }",
         ))
         .unwrap();
-        assert_eq!(t.vertex.attributes, vec![("a_pos".into(), 0, Some(2))]);
+        assert_eq!(t.vertex.attributes, vec![("a_pos".into(), 0, Some(AttrKind::Float(2)))]);
         let names: Vec<_> = t
             .fragment
             .uniforms
@@ -3448,5 +3533,70 @@ mod tests {
              gl_FragColor = c * f(PI);\n}",
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn conditionals_are_decided_with_gl_es_and_defined_before_naga_reads_the_source() {
+        // The prelude of a library that runs on desktop GL as well.
+        let t = translate(&program(
+            QUAD_ES1,
+            "#ifdef GL_ES\nprecision mediump float;\n#else\n#if !defined(lowp)\n#define lowp\n#endif\n\
+             #if !defined(mediump)\n#define mediump\n#endif\n#endif\n\
+             #define K 2\n#if defined(K) && K > 1 || defined(NOPE)\n#define SCALE 0.5\n#else\n#define SCALE 2.0\n#endif\n\
+             #ifdef NOPE\n#error not here\n#endif\n\
+             varying vec2 v_uv; void main() { gl_FragColor = vec4(v_uv * SCALE, 0.0, 1.0); }",
+        ))
+        .unwrap();
+        assert!(t.fragment.module.entry_points.len() == 1);
+        // An error in a branch that is left out is not read.
+        translate(&program(QUAD_ES1, "#if 0\nthis is not GLSL\n#endif\nvoid main() { gl_FragColor = vec4(1.0); }")).unwrap();
+    }
+
+    #[test]
+    fn a_macro_named_as_a_qualifier_is_applied_before_the_declarations_are_read() {
+        // Pixi's WebGL 1 build of a GLSL ES 3.00 shader: the storage words are macros, and so are the output and the
+        // sampling function.
+        let t = translate(&program(
+            "#ifdef GL_ES\n#define in attribute\n#define out varying\n#endif\n\
+             in vec2 a_pos; out vec2 v_uv;\n\
+             void main() { v_uv = a_pos; gl_Position = vec4(a_pos, 0.0, 1.0); }",
+            "#ifdef GL_ES\n#define in varying\n#define finalColor gl_FragColor\n#define texture texture2D\n#endif\n\
+             precision mediump float; in vec2 v_uv; uniform sampler2D u_tex;\n\
+             void main() { finalColor = texture(u_tex, v_uv); }",
+        ))
+        .unwrap();
+        assert_eq!(t.vertex.attributes, vec![("a_pos".into(), 0, Some(AttrKind::Float(2)))]);
+        assert_eq!(t.samplers.len(), 1);
+        // A macro undefined again is not applied: this `out` is the fragment shader's output, not a varying.
+        translate(&program(
+            "#version 300 es\nin vec2 a_pos; out vec2 v_uv;\nvoid main() { v_uv = a_pos; gl_Position = vec4(a_pos, 0.0, 1.0); }",
+            "#version 300 es\n#define out varying\n#undef out\n\
+             precision highp float; in vec2 v_uv; out vec4 o; void main() { o = vec4(v_uv, 0.0, 1.0); }",
+        ))
+        .unwrap();
+    }
+
+    const FRAGMENT_ES3: &str = "#version 300 es\nprecision highp float; out vec4 o; void main() { o = vec4(1.0); }";
+
+    #[test]
+    fn integer_inputs_keep_their_type_and_bit_operations_read() {
+        let t = translate(&program(
+            "#version 300 es\nin vec2 a_pos; in uvec4 joints; in ivec2 shift; in uint flag; in int step_;\n\
+             void main() { uint j = (joints.x & 255u) | (joints.y << 8u); \
+             gl_Position = vec4(a_pos, float(j) + float(shift.x >> 1) + float(flag ^ 3u) + float(step_), 1.0); }",
+            FRAGMENT_ES3,
+        ))
+        .unwrap();
+        let kinds: Vec<_> = t.vertex.attributes.iter().map(|a| (a.0.as_str(), a.2)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("a_pos", Some(AttrKind::Float(2))),
+                ("joints", Some(AttrKind::Uint(4))),
+                ("shift", Some(AttrKind::Int(2))),
+                ("flag", Some(AttrKind::Uint(1))),
+                ("step_", Some(AttrKind::Int(1))),
+            ]
+        );
     }
 }

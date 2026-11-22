@@ -61,7 +61,9 @@ export function parseHtmlFragment(html: string, inSvg = false): DomNode[] {
     }
     if (lt > at) add({ kind: 'text', text: decode(html.slice(at, lt)) });
     if (html.startsWith('<!--', lt)) {
+      // Kept: frameworks anchor blocks on comments (Svelte's templates are `<!---->` markers it walks to).
       const end = html.indexOf('-->', lt + 4);
+      add({ kind: 'comment', data: html.slice(lt + 4, end === -1 ? html.length : end) });
       at = end === -1 ? html.length : end + 3;
       continue;
     }
