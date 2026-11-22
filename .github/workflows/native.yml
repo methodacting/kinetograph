@@ -327,7 +327,12 @@ jobs:
           npm run build -w @kinetographdev/studio
 
       # Packs the packages and the addon, installs them into an empty project outside the repository, renders 30 frames.
+      # macos-15-intel's virtual GPU reports no MTLGPUFamily, and Skia Graphite's Metal start aborts on that (a fatal
+      # assert, so the CPU fallback never runs). The Intel row draws with Skia's CPU backend; a real Intel Mac's GPU is
+      # not exercised here.
       - name: Clean install and render
+        env:
+          KINETOGRAPH_SKIA_CPU: ${{ matrix.platform == 'darwin-x64' && '1' || '' }}
         run: node scripts/smoke/clean-install.mjs
 
   js:
