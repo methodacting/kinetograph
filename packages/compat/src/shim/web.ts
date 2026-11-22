@@ -14,12 +14,12 @@ import { resolveDocumentUrl, resolveProjectFile, resolveCachedRemoteFile, sameOr
 import { OffscreenCanvasShim, rasterizeCanvas, webgpuDeviceInfo } from './canvas.js';
 import { DOMParserShim, DocumentShim, HTMLFormElementShim, HTMLIFrameElementShim, HTMLTemplateElementShim, NodeFilterShim, NodeIteratorShim, TreeWalkerShim, XMLSerializerShim, installDocumentMembers } from './document.js';
 import { AttrShim, NamedNodeMapShim } from './attributes.js';
-import { DomElement, DomFragment, DomNodeBase, DomText, domElementFor, domTextFor, isDomElementShim, selectorContextOf, setImagePictureReader, setImageSizeReader, setProjectFileResolver } from './element.js';
+import { DomCharacterData, DomComment, DomElement, DomFragment, DomNodeBase, DomText, domCommentFor, domElementFor, domTextFor, isDomElementShim, selectorContextOf, setImagePictureReader, setImageSizeReader, setProjectFileResolver } from './element.js';
 import { bodyHost, headHost, htmlHost, pageDocument, setPageViewport } from './host.js';
 import { collectionOf, HTMLCollection, NodeList, nodeListOf } from './lists.js';
 import { RangeShim } from './range.js';
 import { CSSRuleShim, CSSStyleDeclarationShim, CSSStyleSheetShim } from './stylesheet.js';
-import { createHostElement, createHostText } from './tree.js';
+import { createHostComment, createHostElement, createHostText } from './tree.js';
 import { imageSizeOfBytes } from './image-size.js';
 import { IntersectionObserverShim, MutationObserverShim, readbackRoots, ResizeObserverShim } from './observers.js';
 import { matches, queryAll } from './selector.js';
@@ -698,12 +698,15 @@ export function installDomGlobals(): void {
   define(doc, 'createElement', (tag: string) => domElementFor(createHostElement(String(tag))));
   define(doc, 'createElementNS', (ns: string, tag: string) => domElementFor(createHostElement(String(tag), String(ns) === 'http://www.w3.org/2000/svg')));
   define(doc, 'createTextNode', (text: string) => domTextFor(createHostText(String(text))));
+  define(doc, 'createComment', (data: string) => domCommentFor(createHostComment(String(data))));
   define(doc, 'createRange', () => new RangeShim());
   define(g, 'Range', RangeShim);
   define(g, 'CSSStyleSheet', CSSStyleSheetShim);
   define(g, 'CSSRule', CSSRuleShim);
   define(g, 'CSSStyleDeclaration', CSSStyleDeclarationShim);
+  define(g, 'CharacterData', DomCharacterData);
   define(g, 'Text', DomText);
+  define(g, 'Comment', DomComment);
   installDocumentMembers(doc, define);
   define(doc, 'getElementById', function (this: unknown, id: string) {
     return this instanceof DocumentShim ? this.getElementById(id) : (documentQuery(`#${CSS_ESCAPE(String(id))}`, true)[0] ?? null);
