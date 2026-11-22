@@ -26,12 +26,15 @@ import {
 import type { DomNode } from '../types.js';
 
 export type HostText = Extract<DomNode, { kind: 'text' }>;
+export type HostComment = Extract<DomNode, { kind: 'comment' }>;
+/** A node with no children whose content is a string: a text node or a comment (the DOM's `CharacterData`). */
+export type HostCharacterData = HostText | HostComment;
 
 /** What a mutation observer is told. `target` is the element whose children or attributes changed. */
 export type HostMutation =
   | { type: 'childList'; target: HostElement; added: DomNode[]; removed: DomNode[]; previous: DomNode | null; next: DomNode | null }
   | { type: 'attributes'; target: HostElement; name: string; old: string | null }
-  | { type: 'characterData'; target: HostText; old: string };
+  | { type: 'characterData'; target: HostCharacterData; old: string };
 
 let sink: ((mutation: HostMutation) => void) | null = null;
 
@@ -89,6 +92,11 @@ function inDocumentShell(node: DomNode): boolean {
   return top === htmlHost || top === headHost || top === bodyHost;
 }
 
+/** Whether a node of a child list is one the DOM sees: text, a comment, or a DOM element (not a native one). */
+export function isDomChild(node: DomNode): boolean {
+  return node.kind !== 'element' || isDomElement(node.type);
+}
+
 /** What a node that no root holds (made by a script, or in `document.head`) answers: no boxes, its own style. */
 export const detachedReadback: Readback = {
   generation: () => 0,
@@ -98,7 +106,7 @@ export const detachedReadback: Readback = {
     const parent = effectiveParentOf(host);
     return parent !== null && isDomElement(parent.type) ? parent : null;
   },
-  childNodes: (host) => flatten(host.children).filter((n) => n.kind === 'text' || isDomElement(n.type)),
+  childNodes: (host) => flatten(host.children).filter(isDomChild),
   isConnected: inDocumentShell,
   viewport: () => currentBodyRoot()?.viewport() ?? pageViewport(),
   touch: (host) => currentBodyRoot()?.touch(host),
@@ -123,11 +131,11 @@ export function isConnectedHost(node: DomNode): boolean {
   if (inDocumentShell(node)) return true;
   // What a script put on `document.body` before a root held it (at module load) waits in the body's list.
   if (bodyChildren().includes(topOf(node))) return true;
-  for (const readback of readbackRoots()) if (node.kind === 'element' ? readback.isConnected(node) : textIsConnected(readback, node)) return true;
+  for (const readback of readbackRoots()) if (node.kind === 'element' ? readback.isConnected(node) : leafIsConnected(readback, node)) return true;
   return false;
 }
 
-function textIsConnected(readback: Readback, node: HostText): boolean {
+function leafIsConnected(readback: Readback, node: HostCharacterData): boolean {
   const parent = rawParentOf(node);
   return parent !== null ? readback.isConnected(parent) : readback.rootChildren().includes(node);
 }
@@ -146,9 +154,14 @@ export function createHostText(text: string): HostText {
   return { kind: 'text', text: String(text) };
 }
 
+export function createHostComment(data: string): HostComment {
+  return { kind: 'comment', data: String(data) };
+}
+
 /** A copy of a node (and, when `deep`, everything in it): props and what a script wrote on top of them. */
 export function cloneHost(node: DomNode, deep: boolean): DomNode {
   if (node.kind === 'text') return createHostText(node.text);
+  if (node.kind === 'comment') return createHostComment(node.data);
   const copy: HostElement = { kind: 'element', type: node.type, props: { ...propsWithOverlay(node) }, children: [] };
   if (deep) {
     for (const child of node.children) {
@@ -259,10 +272,20 @@ export function appendToBody(child: DomNode): void {
   insertChild(bodyHost, child, null);
 }
 
-/** A script's change to what a text node says. */
-export function setText(node: HostText, text: string): void {
-  if (node.text === text) return;
-  const old = node.text;
+/** The string a text node or a comment holds. */
+export function characterDataOf(node: HostCharacterData): string {
+  return node.kind === 'text' ? node.text : node.data;
+}
+
+/** A script's change to what a text node or a comment says (a comment is never drawn: nothing is laid out again). */
+export function setText(node: HostCharacterData, text: string): void {
+  const old = characterDataOf(node);
+  if (old === text) return;
+  if (node.kind === 'comment') {
+    node.data = text;
+    recordMutation({ type: 'characterData', target: node, old });
+    return;
+  }
   node.text = text;
   const parent = effectiveParentOf(node);
   if (parent === null) currentBodyRoot()?.touch();

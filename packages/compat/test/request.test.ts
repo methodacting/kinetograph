@@ -165,10 +165,11 @@ describe('the island request', () => {
 describe('the HTML fragment parser', () => {
   it('handles void tags, comments, entities, raw text and unclosed tags', () => {
     const nodes = parseHtmlFragment('<br><!-- c --><i>&lt;&#65;&#x42;</i><style>a > b { }</style><p>open');
-    expect(nodes.map((n) => (n.kind === 'element' ? n.type : n.text))).toEqual(['br', 'i', 'style', 'p']);
-    expect((nodes[1] as any).children[0].text).toBe('<AB');
-    expect((nodes[2] as any).children[0].text).toBe('a > b { }');
-    expect((nodes[3] as any).children[0].text).toBe('open');
+    expect(nodes.map((n) => (n.kind === 'element' ? n.type : n.kind))).toEqual(['br', 'comment', 'i', 'style', 'p']);
+    expect(nodes[1]).toEqual({ kind: 'comment', data: ' c ' });
+    expect((nodes[2] as any).children[0].text).toBe('<AB');
+    expect((nodes[3] as any).children[0].text).toBe('a > b { }');
+    expect((nodes[4] as any).children[0].text).toBe('open');
   });
 });
 

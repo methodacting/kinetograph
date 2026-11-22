@@ -54,7 +54,12 @@ export interface HostText {
   kind: 'text';
   text: string;
 }
-export type HostNode = HostElement | HostText;
+/** A comment a script put in the tree (`document.createComment`, `<!-- … -->` in `innerHTML`): never drawn, no place in a path. */
+export interface HostComment {
+  kind: 'comment';
+  data: string;
+}
+export type HostNode = HostElement | HostText | HostComment;
 
 export interface RenderedTree {
   layers: LayerJson[];
@@ -296,6 +301,8 @@ export function flattenDomElement(element: HostElement, path: string, sequences:
 function flattenDomChildren(nodes: HostNode[], parentPath: string, place: { next: number }, sequences: SequenceJson[] | null, probes: Map<string, ProbeAnswer> | null): HostNode[] {
   const out: HostNode[] = [];
   for (const child of nodes) {
+    // A comment is not drawn and takes no place in the paths.
+    if (child.kind === 'comment') continue;
     if (child.kind === 'text') {
       out.push(child);
     } else if (child.type === 'kg-sequence') {
@@ -336,6 +343,7 @@ const INLINE = new Set(['span', 'b', 'i', 'em', 'strong', 'a', 'br', 'small', 'c
 function plainText(element: HostElement): string | undefined {
   let out = '';
   for (const child of element.children) {
+    if (child.kind === 'comment') continue;
     if (child.kind === 'text') {
       out += child.text;
     } else if (INLINE.has(child.type)) {
@@ -368,7 +376,7 @@ export function collectNames(roots: HostNode[]): LayerNames {
     group: { name: string | undefined },
   ): void => {
     for (const node of nodes) {
-      if (node.kind === 'text') continue;
+      if (node.kind !== 'element') continue;
       if (node.type === 'kg-sequence') {
         const { sequence, wrapped } = node.props as { sequence: Omit<SequenceJson, 'layer'>; wrapped: boolean };
         const name = wrapped ? sequenceNames(sequence.name, node.origin).label : undefined;
@@ -527,6 +535,8 @@ class Emitter {
         // The reconciler refuses these on the way in; this keeps `emit` honest on its own.
         throw new Error(`Raw text "${node.text}" is not allowed inside <${parentName}>; wrap it in <Text>`);
       }
+      // A comment a script put here is not drawn and takes no place in the paths.
+      if (node.kind === 'comment') continue;
       if (node.type === 'kg-sequence') {
         const { sequence, wrapped } = node.props as { sequence: Omit<SequenceJson, 'layer'>; wrapped: boolean };
         const record: SequenceJson = { ...sequence, layer: null, ...sequenceNames(sequence.name, node.origin) };
@@ -560,6 +570,7 @@ class Emitter {
     const objects: Object3DJson[] = [];
     for (const node of scene.children) {
       if (node.kind === 'text') throw new Error(`Raw text "${node.text}" is not allowed inside <Scene3D>; use <Text3D>`);
+      if (node.kind === 'comment') continue;
       switch (node.type) {
         case 'kg-camera3d':
           if (camera !== undefined) throw new Error('A <Scene3D> takes one <Camera3D>');
@@ -623,6 +634,7 @@ class Emitter {
         const children: Object3DJson[] = [];
         for (const child of node.children) {
           if (child.kind === 'text') throw new Error(`Raw text "${child.text}" is not allowed inside <Group3D>; use <Text3D>`);
+          if (child.kind === 'comment') continue;
           children.push(this.object3d(child, 'Group3D'));
         }
         return { type: 'group', children, ...placement } as Object3DJson;

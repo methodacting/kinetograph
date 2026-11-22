@@ -37,18 +37,23 @@ import { attributeMapOf, AttrShim, type NamedNodeMapShim } from './attributes.js
 import { bodyHost, pageDocument, pageViewport, effectiveParentOf, headHost, htmlHost, overlayOf, propsWithOverlay, rawParentOf, setRawParent, type BoxInfo, type HostElement, type Readback } from './host.js';
 import { matches, queryAll, type SelectorContext } from './selector.js';
 import {
+  characterDataOf,
   clearChildren,
   cloneHost,
+  createHostComment,
   createHostElement,
   createHostText,
   insertChild,
   isConnectedHost,
+  isDomChild,
   isShellHost,
   oldAttribute,
   readbackOfHost,
   recordAttribute,
   removeChild,
   setText,
+  type HostCharacterData,
+  type HostComment,
   type HostText,
 } from './tree.js';
 
@@ -229,12 +234,16 @@ export function computedStyleOf(host: HostElement, readback: Readback): CSSStyle
 
 type Listener = ((event: any) => void) | { handleEvent(event: any): void };
 
+/** A node that can be in a child list, as a script sees it. */
+export type DomChildNode = DomElement | DomCharacterData;
+
 const elements = new WeakMap<HostElement, DomElement>();
 const players = new WeakMap<HostElement, MediaPlayer>();
-const childLists = new WeakMap<HostElement, NodeList<DomElement | DomText>>();
+const childLists = new WeakMap<HostElement, NodeList<DomChildNode>>();
 /** A `<template>`'s content: a fragment of its own. */
 const templateContents = new WeakMap<HostElement, HostElement>();
 const texts = new WeakMap<HostText, DomText>();
+const comments = new WeakMap<HostComment, DomComment>();
 
 /** The DOM-like object for a text node of the host tree (one per node). */
 export function domTextFor(host: HostText): DomText {
@@ -246,14 +255,25 @@ export function domTextFor(host: HostText): DomText {
   return text;
 }
 
+/** The DOM-like object for a comment of the host tree (one per node). */
+export function domCommentFor(host: HostComment): DomComment {
+  let comment = comments.get(host);
+  if (comment === undefined) {
+    comment = new DomComment(host);
+    comments.set(host, comment);
+  }
+  return comment;
+}
+
 /** The object for a host node, whichever kind it is. */
-export function domNodeFor(host: DomNode): DomElement | DomText {
-  return host.kind === 'element' ? domElementFor(host) : domTextFor(host);
+export function domNodeFor(host: DomNode): DomChildNode {
+  if (host.kind === 'element') return domElementFor(host);
+  return host.kind === 'text' ? domTextFor(host) : domCommentFor(host);
 }
 
 /** The host node behind a shim node. */
 export function hostNodeOf(value: unknown): DomNode | null {
-  return value instanceof DomElement || value instanceof DomText ? value.host : null;
+  return value instanceof DomElement || value instanceof DomCharacterData ? value.host : null;
 }
 
 /** How selectors read the host tree of a root. */
@@ -287,7 +307,7 @@ export function isDomElementShim(value: unknown): value is DomElement {
   return value instanceof DomElement;
 }
 
-type Positioned = DomElement | DomText;
+type Positioned = DomChildNode;
 
 const POSITION = { DISCONNECTED: 1, PRECEDING: 2, FOLLOWING: 4, CONTAINS: 8, CONTAINED_BY: 16, IMPLEMENTATION_SPECIFIC: 32 } as const;
 const detachedOrder = new WeakMap<object, number>();
@@ -297,7 +317,7 @@ let detachedCount = 0;
 function documentPosition(a: Positioned, b: unknown): number {
   const document = (globalThis as { document?: unknown }).document;
   if (b === document && b !== undefined) return POSITION.CONTAINS | POSITION.PRECEDING;
-  if (!(b instanceof DomElement) && !(b instanceof DomText)) throw new TypeError("Failed to execute 'compareDocumentPosition': parameter 1 is not of type 'Node'.");
+  if (!(b instanceof DomElement) && !(b instanceof DomCharacterData)) throw new TypeError("Failed to execute 'compareDocumentPosition': parameter 1 is not of type 'Node'.");
   if (a === b) return 0;
   const chain = (n: Positioned): Positioned[] => {
     const out: Positioned[] = [n];
@@ -404,40 +424,42 @@ export class DomNodeBase {
   static readonly DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
   get nodeType(): number {
     const host = (this as unknown as { host: DomNode }).host;
-    return host.kind === 'text' ? 3 : host.type === FRAGMENT ? 11 : 1;
+    if (host.kind !== 'element') return host.kind === 'text' ? 3 : 8;
+    return host.type === FRAGMENT ? 11 : 1;
   }
   get nodeName(): string {
     const host = (this as unknown as { host: DomNode }).host;
-    return host.kind === 'text' ? '#text' : host.type === FRAGMENT ? '#document-fragment' : (this as unknown as DomElement).tagName;
+    if (host.kind !== 'element') return host.kind === 'text' ? '#text' : '#comment';
+    return host.type === FRAGMENT ? '#document-fragment' : (this as unknown as DomElement).tagName;
   }
   get nodeValue(): string | null {
     const host = (this as unknown as { host: DomNode }).host;
-    return host.kind === 'text' ? host.text : null;
+    return host.kind === 'element' ? null : characterDataOf(host);
   }
   get ownerDocument(): unknown {
     return ownerDocumentOf((this as unknown as { host: DomNode }).host);
   }
   // The tree links are `Node`'s too: Svelte's runtime takes the `firstChild` and `nextSibling` getters from
   // `Node.prototype` once and calls them on every node. Each kind of node gives its own lists.
-  get childNodes(): NodeList<DomElement | DomText> {
+  get childNodes(): NodeList<DomChildNode> {
     return nodeListOf([]);
   }
-  get firstChild(): DomElement | DomText | null {
+  get firstChild(): DomChildNode | null {
     return this.childNodes[0] ?? null;
   }
-  get lastChild(): DomElement | DomText | null {
+  get lastChild(): DomChildNode | null {
     return this.childNodes.at(-1) ?? null;
   }
   /** The nodes next to this one (its parent's children), itself included; a node in no list has none. */
   protected siblingHosts(): DomNode[] {
     return [];
   }
-  get nextSibling(): DomElement | DomText | null {
+  get nextSibling(): DomChildNode | null {
     const list = this.siblingHosts();
     const next = list[list.indexOf((this as unknown as { host: DomNode }).host) + 1];
     return next === undefined ? null : domNodeFor(next);
   }
-  get previousSibling(): DomElement | DomText | null {
+  get previousSibling(): DomChildNode | null {
     const list = this.siblingHosts();
     const at = list.indexOf((this as unknown as { host: DomNode }).host);
     return at <= 0 ? null : domNodeFor(list[at - 1]!);
@@ -470,7 +492,50 @@ export function gestureListenerElements(): DomElement[] {
   return [...gestureListeners];
 }
 
-export class DomElement extends DomNodeBase {
+/**
+ * `ChildNode`'s `before`, `after`, `replaceWith` and `remove`, for elements, text and comments alike (a document has
+ * none): Svelte puts each block's nodes in place with `anchor.before(…)`, and its anchors are comments and text nodes.
+ */
+export abstract class DomChildNodeBase extends DomNodeBase {
+  abstract readonly host: DomNode;
+  /** The element whose children this node is among; null when it has none. */
+  protected abstract childNodeParent(): HostElement | null;
+  /** Puts `nodes` in this node's parent, before it. */
+  before(...nodes: unknown[]): void {
+    const parent = this.childNodeParent();
+    if (parent === null) return;
+    for (const host of hostsOf(nodes)) insertChild(parent, host, this.host);
+  }
+  after(...nodes: unknown[]): void {
+    const parent = this.childNodeParent();
+    if (parent === null) return;
+    const next = this.nextSibling === null ? null : hostNodeOf(this.nextSibling);
+    for (const host of hostsOf(nodes)) insertChild(parent, host, next);
+  }
+  replaceWith(...nodes: unknown[]): void {
+    const parent = this.childNodeParent();
+    if (parent === null) return;
+    const next = this.nextSibling === null ? null : hostNodeOf(this.nextSibling);
+    const hosts = hostsOf(nodes).filter((h) => h !== this.host);
+    removeChild(this.host);
+    for (const host of hosts) insertChild(parent, host, next);
+  }
+  remove(): void {
+    removeChild(this.host);
+  }
+}
+
+/** The nodes a script passes (nodes or strings) as host nodes; a string is a text node. A node already in a tree is moved. */
+function hostsOf(nodes: unknown[]): DomNode[] {
+  return expandFragments(
+    nodes.map((n) => {
+      const host = hostNodeOf(n);
+      return host ?? createHostText(String(n));
+    }),
+  );
+}
+
+export class DomElement extends DomChildNodeBase {
   private listeners = new Map<string, Set<Listener>>();
   private styleObject: CSSStyleDeclarationShim | null = null;
 
@@ -687,6 +752,9 @@ export class DomElement extends DomNodeBase {
   private wrap(node: HostElement | null): DomElement | null {
     return node === null ? null : domElementFor(node);
   }
+  protected override childNodeParent(): HostElement | null {
+    return this.domParent();
+  }
   /** The element this one hangs from: a DOM element, `body` at the top of a root, `html` above `body` and `head`. */
   private domParent(): HostElement | null {
     if (this.host === htmlHost || this.host === pageDocument()?.html) return null;
@@ -714,7 +782,7 @@ export class DomElement extends DomNodeBase {
   private childHosts(): DomNode[] {
     return this.readback.childNodes(this.host);
   }
-  get childNodes(): NodeList<DomElement | DomText> {
+  override get childNodes(): NodeList<DomChildNode> {
     // One list per element, refilled each time it is asked for (a form's `childNodes` is compared with itself to find clobbering).
     let list = childLists.get(this.host);
     const nodes = this.childHosts().map(domNodeFor);
@@ -725,7 +793,7 @@ export class DomElement extends DomNodeBase {
       list.length = 0;
       list.push(...nodes);
     }
-    return list as NodeList<DomElement | DomText>;
+    return list as NodeList<DomChildNode>;
   }
   get children(): HTMLCollection<DomElement> {
     return collectionOf(this.childNodes.filter((n): n is DomElement => n instanceof DomElement));
@@ -747,7 +815,7 @@ export class DomElement extends DomNodeBase {
     const parent = effectiveParentOf(this.host);
     if (parent !== null) return this.readback.childNodes(parent);
     if (this.host === headHost || this.host === bodyHost) return [headHost, bodyHost];
-    return this.readback.roots().filter((n) => n.kind === 'text' || isDomElement(n.type));
+    return this.readback.roots().filter(isDomChild);
   }
   get nextElementSibling(): DomElement | null {
     const list = this.siblingHosts();
@@ -767,7 +835,7 @@ export class DomElement extends DomNodeBase {
   }
   get textContent(): string {
     const text = (nodes: DomNode[]): string =>
-      nodes.map((n) => (n.kind === 'text' ? n.text : n.type === 'style' || n.type === 'script' ? '' : text(this.readback.childNodes(n)))).join('');
+      nodes.map((n) => (n.kind === 'text' ? n.text : n.kind === 'comment' || n.type === 'style' || n.type === 'script' ? '' : text(this.readback.childNodes(n)))).join('');
     return text(this.childHosts());
   }
   set textContent(value: string | null) {
@@ -808,15 +876,6 @@ export class DomElement extends DomNodeBase {
 
   // ---- changing the tree (tree.ts) ----
 
-  /** The nodes a script passes (nodes or strings) as host nodes; a string is a text node. A node already in a tree is moved. */
-  private static hostsOf(nodes: unknown[]): DomNode[] {
-    return expandFragments(
-      nodes.map((n) => {
-        const host = hostNodeOf(n);
-        return host ?? createHostText(String(n));
-      }),
-    );
-  }
   private static required(node: unknown, method: string): DomNode {
     const host = hostNodeOf(node);
     if (host === null) throw new TypeError(`Failed to execute '${method}' on 'Node': parameter 1 is not of type 'Node'.`);
@@ -830,6 +889,9 @@ export class DomElement extends DomNodeBase {
         if (child.kind === 'element') {
           previous = null;
           visit(child);
+        } else if (child.kind === 'comment') {
+          // Only text nodes next to each other are joined.
+          previous = null;
         } else if (child.text === '') {
           removeChild(child);
         } else if (previous !== null) {
@@ -884,39 +946,16 @@ export class DomElement extends DomNodeBase {
     return list[list.indexOf(host) + 1] ?? null;
   }
   append(...nodes: unknown[]): void {
-    for (const host of DomElement.hostsOf(nodes)) insertChild(this.host, host, null);
+    for (const host of hostsOf(nodes)) insertChild(this.host, host, null);
   }
   prepend(...nodes: unknown[]): void {
     const first = this.childHosts()[0] ?? null;
-    for (const host of DomElement.hostsOf(nodes)) insertChild(this.host, host, first);
+    for (const host of hostsOf(nodes)) insertChild(this.host, host, first);
   }
   replaceChildren(...nodes: unknown[]): void {
-    const hosts = DomElement.hostsOf(nodes);
+    const hosts = hostsOf(nodes);
     clearChildren(this.host);
     for (const host of hosts) insertChild(this.host, host, null);
-  }
-  /** Puts `nodes` in this node's parent, before it. */
-  before(...nodes: unknown[]): void {
-    const parent = this.domParent();
-    if (parent === null) return;
-    for (const host of DomElement.hostsOf(nodes)) insertChild(parent, host, this.host);
-  }
-  after(...nodes: unknown[]): void {
-    const parent = this.domParent();
-    if (parent === null) return;
-    const next = this.nextSibling === null ? null : hostNodeOf(this.nextSibling);
-    for (const host of DomElement.hostsOf(nodes)) insertChild(parent, host, next);
-  }
-  replaceWith(...nodes: unknown[]): void {
-    const parent = this.domParent();
-    if (parent === null) return;
-    const next = this.nextSibling === null ? null : hostNodeOf(this.nextSibling);
-    const hosts = DomElement.hostsOf(nodes).filter((h) => h !== this.host);
-    removeChild(this.host);
-    for (const host of hosts) insertChild(parent, host, next);
-  }
-  remove(): void {
-    removeChild(this.host);
   }
   cloneNode(deep = false): DomElement {
     const copy = cloneHost(this.host, Boolean(deep)) as HostElement;
@@ -1942,6 +1981,7 @@ const escapeAttribute = (text: string): string => text.replace(/&/g, '&amp;').re
 /** A host node as markup. */
 export function serializeHost(node: DomNode, inSvg = false): string {
   if (node.kind === 'text') return escapeText(node.text);
+  if (node.kind === 'comment') return `<!--${node.data}-->`;
   if (node.type === 'kg-sequence' || node.type === FRAGMENT) return node.children.map((c) => serializeHost(c, inSvg)).join('');
   if (!isDomElement(node.type)) return '';
   // SVG attribute names keep their case (`viewBox`); inside `foreignObject` it is HTML again.
@@ -1968,6 +2008,7 @@ const xmlEscape = (text: string): string => text.replace(/&/g, '&amp;').replace(
  */
 export function serializeXml(node: DomNode, parentNs: string | null = null, inSvg = false): string {
   if (node.kind === 'text') return xmlEscape(node.text);
+  if (node.kind === 'comment') return `<!--${node.data}-->`;
   if (node.type === 'kg-sequence' || node.type === FRAGMENT) return node.children.map((c) => serializeXml(c, parentNs, inSvg)).join('');
   if (!isDomElement(node.type)) return '';
   const svg = inSvg || isSvgTag(node.type);
@@ -1987,9 +2028,9 @@ export function serializeXml(node: DomNode, parentNs: string | null = null, inSv
   return inner === '' ? `${open}/>` : `${open}>${inner}</${node.type}>`;
 }
 
-/** A text node of the host tree, as a script sees it. */
-export class DomText extends DomNodeBase {
-  constructor(readonly host: HostText) {
+/** A text node or a comment of the host tree, as a script sees it (the DOM's `CharacterData`). */
+export class DomCharacterData extends DomChildNodeBase {
+  constructor(readonly host: HostCharacterData) {
     super();
   }
   hasChildNodes(): boolean {
@@ -1997,30 +2038,33 @@ export class DomText extends DomNodeBase {
   }
   normalize(): void {}
   get data(): string {
-    return this.host.text;
+    return characterDataOf(this.host);
   }
   set data(value: string) {
     setText(this.host, String(value));
   }
-  get nodeValue(): string {
-    return this.host.text;
+  override get nodeValue(): string {
+    return characterDataOf(this.host);
   }
-  set nodeValue(value: string) {
+  override set nodeValue(value: string) {
     setText(this.host, String(value));
   }
   get textContent(): string {
-    return this.host.text;
+    return characterDataOf(this.host);
   }
   set textContent(value: string) {
     setText(this.host, String(value));
   }
   get length(): number {
-    return this.host.text.length;
+    return characterDataOf(this.host).length;
   }
   private parentHost(): HostElement | null {
     const parent = effectiveParentOf(this.host);
     if (parent !== null) return parent;
     return isConnectedHost(this.host) ? bodyHost : null;
+  }
+  protected override childNodeParent(): HostElement | null {
+    return this.parentHost();
   }
   get parentElement(): DomElement | null {
     const parent = this.parentHost();
@@ -2038,17 +2082,31 @@ export class DomText extends DomNodeBase {
     const parent = this.parentHost();
     return parent === null ? [] : readbackOfHost(parent).childNodes(parent);
   }
-  remove(): void {
-    removeChild(this.host);
-  }
-  cloneNode(): DomText {
-    return domTextFor(createHostText(this.host.text));
-  }
   compareDocumentPosition(other: unknown): number {
     return documentPosition(this, other);
   }
   contains(other: unknown): boolean {
     return other === this;
+  }
+}
+
+/** A text node of the host tree, as a script sees it. */
+export class DomText extends DomCharacterData {
+  constructor(override readonly host: HostText) {
+    super(host);
+  }
+  cloneNode(): DomText {
+    return domTextFor(createHostText(this.host.text));
+  }
+}
+
+/** A comment of the host tree (`<!-- … -->`, `document.createComment`): a place among its siblings, never drawn. */
+export class DomComment extends DomCharacterData {
+  constructor(override readonly host: HostComment) {
+    super(host);
+  }
+  cloneNode(): DomComment {
+    return domCommentFor(createHostComment(this.host.data));
   }
 }
 
@@ -2142,7 +2200,7 @@ function imageSize(src: string): { width: number; height: number } | null {
 }
 
 // `Node.DOCUMENT_POSITION_*`, on the constructors and on the instances.
-for (const cls of [DomElement, DomText]) {
+for (const cls of [DomElement, DomCharacterData]) {
   for (const [name, bit] of Object.entries(POSITION)) {
     Object.defineProperty(cls, `DOCUMENT_POSITION_${name}`, { value: bit });
     Object.defineProperty(cls.prototype, `DOCUMENT_POSITION_${name}`, { value: bit });

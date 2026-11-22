@@ -8,7 +8,10 @@ export type { Unsupported };
 /** A host node as the reconciler keeps it: the same shape as `@kinetographdev/react`'s `HostNode`. */
 export type DomNode =
   | { kind: 'element'; type: string; props: Record<string, any>; children: DomNode[] }
-  | { kind: 'text'; text: string };
+  | { kind: 'text'; text: string }
+  // A comment (`<!-- … -->`, `document.createComment`): a place in a child list (frameworks anchor blocks on them),
+  // never drawn, never in layout, and no index in a host-tree path.
+  | { kind: 'comment'; data: string };
 
 export interface IslandContext {
   /** The island root's host-tree index path (`$0.2`). */

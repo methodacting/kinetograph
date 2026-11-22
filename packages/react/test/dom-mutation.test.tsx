@@ -187,6 +187,48 @@ describe('a script putting nodes into the tree', () => {
     expect(children).toBeUndefined();
   });
 
+  it('keeps the comments a framework anchors on, and the island never holds them', () => {
+    const seen: Record<string, unknown> = {};
+    function Probe() {
+      const ref = useRef<any>(null);
+      useLayoutEffect(() => {
+        const el = ref.current;
+        // Svelte: a template whose `<!---->` markers it walks to, cloned and put in place before a text anchor.
+        const template = g.document.createElement('template');
+        template.innerHTML = '<!----><p id="a">x</p><!-- end -->';
+        const fragment = template.content.cloneNode(true);
+        const start = fragment.firstChild;
+        seen.walked = [start.nodeType, start.nodeName, start.data, start instanceof g.Comment, start.nextSibling.id, start.nextSibling.nextSibling.data];
+        const anchor = g.document.createTextNode('');
+        el.appendChild(anchor);
+        anchor.before(fragment);
+        // Vue: an empty `v-if` is a comment it inserts before its anchor.
+        const empty = g.document.createComment('v-if');
+        el.insertBefore(empty, anchor);
+        empty.before(Object.assign(g.document.createElement('span'), { id: 'b' }));
+        seen.nodes = Array.from(el.childNodes).map((n: any) => n.nodeName);
+        seen.children = tagsOf(el);
+        seen.text = el.textContent;
+        seen.html = el.innerHTML;
+        seen.copy = Array.from(el.cloneNode(true).childNodes).map((n: any) => n.nodeType);
+        // Measuring sends the island's request.
+        el.querySelector('#a').getBoundingClientRect();
+      }, []);
+      return <div ref={ref} />;
+    }
+    render(<Probe />).root.unmount();
+    expect(seen).toEqual({
+      walked: [8, '#comment', '', true, 'a', ' end '],
+      nodes: ['#comment', 'P', '#comment', 'SPAN', '#comment', '#text'],
+      children: ['p#a', 'span#b'],
+      text: 'x',
+      html: '<!----><p id="a">x</p><!-- end --><span id="b"></span><!--v-if-->',
+      copy: [8, 1, 8, 1, 8, 3],
+    });
+    const island = requests.at(-1)!.root;
+    expect(island.children.map((c: any) => `${c.kind}:${c.path ?? c.text}`)).toEqual(['element:$0.0', 'element:$0.1', 'text:']);
+  });
+
   it('draws on a canvas it made before and after it is put in the tree', () => {
     function Probe() {
       const ref = useRef<any>(null);

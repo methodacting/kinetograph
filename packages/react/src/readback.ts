@@ -237,7 +237,7 @@ export function createReadback(container: Container, options: EmitOptions): Read
       // A sheet's text is the document's CSS, wherever the `<style>` is.
       if (host.type === 'style' || host.type === 'link') return null;
       if (islandRootOf(host) !== root) continue;
-      changed.push({ path: pathOf(host), node: { ...host, props: propsWithOverlay(host) }, children: flatten(host.children).map((n) => (n.kind === 'text' ? n.text : null)) });
+      changed.push({ path: pathOf(host), node: { ...host, props: propsWithOverlay(host) }, children: flatten(host.children).filter((n) => n.kind !== 'comment').map((n) => (n.kind === 'text' ? n.text : null)) });
     }
     const set = islandEdits(state, changed, options.time?.() ?? 0);
     if (set === null) return null;
@@ -391,7 +391,7 @@ export function createReadback(container: Container, options: EmitOptions): Read
       // An `<AbsoluteFill>` holding DOM is the `div` it is in Remotion: a script sees it as the parent.
       return isDom(parent) || (parent !== null && inCss(parent)) ? parent : null;
     },
-    childNodes: (host) => flatten(host.children).filter((n) => n.kind === 'text' || isDomElement(n.type)),
+    childNodes: (host) => flatten(host.children).filter((n) => n.kind !== 'element' || isDomElement(n.type)),
     isConnected(host) {
       let top: HostElement = host;
       for (let p = rawParentOf(top); p !== null; p = rawParentOf(top)) top = p;
