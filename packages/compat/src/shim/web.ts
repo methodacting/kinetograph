@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { CANVAS_SOURCE, CanvasContext2D, CanvasGradient, CanvasPattern, ImageData, Path2D, WebGLContext, createGpu, GPU_GLOBALS, pictureOf, type CanvasPicture } from '@kinetographdev/scene';
 import { resolveDocumentUrl, resolveProjectFile, resolveCachedRemoteFile, sameOriginPath } from '../environment.js';
 import { OffscreenCanvasShim, rasterizeCanvas, webgpuDeviceInfo } from './canvas.js';
-import { DOMParserShim, DocumentShim, HTMLFormElementShim, HTMLTemplateElementShim, NodeFilterShim, NodeIteratorShim, TreeWalkerShim, XMLSerializerShim, installDocumentMembers } from './document.js';
+import { DOMParserShim, DocumentShim, HTMLFormElementShim, HTMLIFrameElementShim, HTMLTemplateElementShim, NodeFilterShim, NodeIteratorShim, TreeWalkerShim, XMLSerializerShim, installDocumentMembers } from './document.js';
 import { AttrShim, NamedNodeMapShim } from './attributes.js';
 import { DomElement, DomFragment, DomNodeBase, DomText, domElementFor, domTextFor, isDomElementShim, selectorContextOf, setImagePictureReader, setImageSizeReader, setProjectFileResolver } from './element.js';
 import { bodyHost, headHost, htmlHost, pageDocument, setPageViewport } from './host.js';
@@ -625,6 +625,7 @@ export function installDomGlobals(): void {
   define(g, 'DocumentFragment', DomFragment);
   define(g, 'HTMLTemplateElement', HTMLTemplateElementShim);
   define(g, 'HTMLFormElement', HTMLFormElementShim);
+  define(g, 'HTMLIFrameElement', HTMLIFrameElementShim);
   define(g, 'NamedNodeMap', NamedNodeMapShim);
   define(g, 'Attr', AttrShim);
   define(g, 'NodeFilter', NodeFilterShim);
