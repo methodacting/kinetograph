@@ -599,6 +599,38 @@ describe('the log of a frame: what it depends on', () => {
     expect(context.content().webgpu!.impure).toBeUndefined();
   });
 
+  it('draws into a canvas configured as a storage texture: a new texture stands in for it each frame, drawn into the canvas', async () => {
+    const { device, context } = await setup();
+    context.configure({ device, format: 'rgba8unorm', alphaMode: 'premultiplied', usage: STORAGE_BINDING | RENDER_ATTACHMENT });
+    const layout = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: COMPUTE, storageTexture: { format: 'rgba8unorm' } }] });
+    const module = device.createShaderModule({ code: '@group(0) @binding(0) var out: texture_storage_2d<rgba8unorm, write>; @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3u) { textureStore(out, vec2i(id.xy), vec4f(1)); }' });
+    const pipeline = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module } });
+    const textureOf = (webgpu: WebGpuContent, commands: { c: string; group?: string }[]): string | undefined => {
+      const group = commands.find((c) => c.c === 'bind')?.group;
+      const entry = group === undefined ? undefined : webgpu.bindGroups[group]?.entries[0];
+      return entry !== undefined && 'texture' in entry ? entry.texture.id : undefined;
+    };
+    const seen = new Set<string>();
+    for (let frame = 0; frame < 3; frame += 1) {
+      context.resetState();
+      dispatch(device, pipeline, device.createBindGroup({ layout, entries: [{ binding: 0, resource: context.getCurrentTexture().createView() }] }));
+      const webgpu = context.content().webgpu!;
+      const [compute, render] = webgpu.passes;
+      expect(webgpu.passes.map((p) => p.k)).toEqual(['compute', 'render']);
+      // The render pass draws into the canvas what the compute pass wrote; earlier frames' textures went with their frames.
+      expect(render).not.toHaveProperty('target');
+      const written = textureOf(webgpu, compute!.commands);
+      expect(written).toBeDefined();
+      expect(textureOf(webgpu, render!.commands)).toBe(written);
+      expect(Object.keys(webgpu.textures!)).toEqual([written]);
+      expect(webgpu.impure).toBeUndefined();
+      seen.add(written!);
+    }
+    expect(seen.size).toBe(3);
+    // As in a browser without bgra8unorm-storage.
+    expect(() => context.configure({ device, format: 'bgra8unorm', usage: STORAGE_BINDING | RENDER_ATTACHMENT })).toThrow(/STORAGE_BINDING/);
+  });
+
   it('is the same whichever frames were drawn before it, for a page that redraws what it reads', async () => {
     const draw = async (frames: number): Promise<string> => {
       const { device, context } = await setup();
