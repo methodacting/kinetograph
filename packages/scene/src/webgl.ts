@@ -2640,13 +2640,15 @@ export class WebGLContext {
   }
 
   /** WebGL 2's `texStorage3D`: a 3D or array texture of this size, zeros, of one level (more are refused: only level 0 is held). */
-  texStorage3D(target: number, levels: number, internalformat: number, width: number, height: number, depth: number): void {
+  texStorage3D(target: number, levelsArg: number, internalformat: number, widthArg: number, heightArg: number, depthArg: number): void {
+    // GLsizei arguments, truncated to integers as a browser converts them (as `texStorage2D`).
+    const [levels, width, height, depth] = [levelsArg, widthArg, heightArg, depthArg].map(Math.trunc) as [number, number, number, number];
     const bound = this.bound3d(target);
     if (bound === null) return;
     const { texture, limit } = bound;
-    if (!(Number.isInteger(levels) && levels >= 1)) return this.fail(GL.INVALID_VALUE);
+    if (!(levels >= 1)) return this.fail(GL.INVALID_VALUE);
     const sides = [width, height, depth];
-    if (!sides.every((v) => Number.isInteger(v) && v >= 1) || Math.max(width, height) > MAX_3D_TEXTURE_SIZE || depth > limit) return this.fail(GL.INVALID_VALUE);
+    if (!sides.every((v) => v >= 1) || Math.max(width, height) > MAX_3D_TEXTURE_SIZE || depth > limit) return this.fail(GL.INVALID_VALUE);
     if (levels > 1) throw new WebGLUnsupportedError('texStorage3D of more than one level; a 3D or array texture has one level');
     const float = FLOAT_FORMATS[internalformat];
     const format = float?.format ?? FORMATS_8BIT_3D[internalformat];
@@ -2761,7 +2763,9 @@ export class WebGLContext {
   }
 
   /** WebGL 2's `texStorage2D`: a texture of this size, empty, with `levels` mip levels. */
-  texStorage2D(target: number, levels: number, internalformat: number, width: number, height: number): void {
+  texStorage2D(target: number, levelsArg: number, internalformat: number, widthArg: number, heightArg: number): void {
+    // GLsizei arguments, truncated to integers as a browser converts them: three.js passes `Math.log2(size) + 1` levels.
+    const [levels, width, height] = [levelsArg, widthArg, heightArg].map(Math.trunc) as [number, number, number];
     const texture = this.bound(target);
     if (texture === null) return;
     if (!(levels >= 1 && levels <= 16)) return this.fail(GL.INVALID_VALUE);

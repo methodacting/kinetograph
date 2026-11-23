@@ -722,7 +722,8 @@ describe('the recording WebGL context', () => {
       const { gl, program } = setup2();
       const texture = gl.createTexture();
       gl.bindTexture(GL.TEXTURE_2D, texture);
-      gl.texStorage2D(GL.TEXTURE_2D, 3, GL2.RGBA8, 32, 32);
+      // A GLsizei is truncated to an integer, as a browser does: three.js passes `Math.log2(size) + 1` levels.
+      gl.texStorage2D(GL.TEXTURE_2D, Math.log2(6) + 1, GL2.RGBA8, 32, 32);
       gl.texParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST_MIPMAP_NEAREST);
       gl.bindFramebuffer(GL.FRAMEBUFFER, gl.createFramebuffer());
       gl.framebufferTexture2D(GL.FRAMEBUFFER, GL.COLOR_ATTACHMENT0, GL.TEXTURE_2D, texture, 0);
