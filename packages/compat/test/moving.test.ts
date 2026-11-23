@@ -1,7 +1,8 @@
 // Whether an island's CSS can move anything (`islandMoves`): the cases of crates/dom/src/moving.rs, which this check
 // must agree with or be more cautious than.
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { historyFor, noteTransitions, recordIsland, resetTransitionWindow, setHistoryMode } from '../src/dom/history.js';
 import { islandMoves } from '../src/dom/moving.js';
 import type { RequestNode } from '../src/request/build.js';
 
@@ -75,5 +76,28 @@ describe('islandMoves', () => {
     expect(islandMoves([], [tree([]), { ...(tree([]) as Extract<RequestNode, { kind: 'element' }>), children: [sheet] }])).toBe(true);
     // A history tree's classes count.
     expect(islandMoves(['.transition { transition: all 1s }'], [tree(['flex']), tree(['transition'])])).toBe(true);
+  });
+});
+
+describe('the history an island that moves is sent with', () => {
+  afterEach(() => {
+    setHistoryMode({ record: false });
+    resetTransitionWindow();
+  });
+
+  it('keeps no canvas drawing: a state that differs only in what its canvases drew is not a new one', () => {
+    // A WebGL recording holds its textures' pixels: an island's history of them outgrew a string within three frames.
+    const drawn = (frame: number): RequestNode => ({
+      ...(tree(['transition']) as Extract<RequestNode, { kind: 'element' }>),
+      children: [
+        { kind: 'element', tag: 'canvas', path: '$0.0', attrs: { width: '4', height: '4', 'data-kg-webgl': `{"ops":[${frame}]}` }, style: '', children: [] },
+        { kind: 'element', tag: 'canvas', path: '$0.1', attrs: { width: '4', height: '4', 'data-kg-canvas': `[${frame}]` }, style: '', children: [] },
+      ],
+    });
+    setHistoryMode({ record: true });
+    noteTransitions(drawn(0), [TAILWIND]);
+    for (const frame of [0, 1, 2]) recordIsland('$0', frame / 30, drawn(frame));
+    const blank = (path: string) => ({ kind: 'element', tag: 'canvas', path, attrs: { width: '4', height: '4' }, style: '', children: [] });
+    expect(historyFor('$0', 3 / 30)).toEqual([{ time: 0, root: { ...drawn(0), children: [blank('$0.0'), blank('$0.1')] } }]);
   });
 });

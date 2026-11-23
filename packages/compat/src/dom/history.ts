@@ -77,9 +77,28 @@ export function historyFor(path: string, time: number): IslandSnapshotJson[] {
   return (trail.get(path) ?? []).filter((s) => s.time < time);
 }
 
-/** Keeps the island's state at `time` if it is not the one before it. */
-export function recordIsland(path: string, time: number, root: RequestNode): void {
+/**
+ * The attributes a canvas's drawing is written in (`withCanvasCommands`). The Rust side replays a history for its styles
+ * and draws only the request's own tree, so a state keeps none: a WebGL recording holds its textures' pixels, and an
+ * island's history of them outgrows a string within a few frames.
+ */
+const DRAWINGS = new Set(['data-kg-webgl', 'data-kg-canvas']);
+
+/** `node` without the drawings of its canvases. */
+function withoutDrawings(node: RequestNode): RequestNode {
+  if (node.kind !== 'element') return node;
+  const drawn = Object.keys(node.attrs).some((name) => DRAWINGS.has(name));
+  return {
+    ...node,
+    attrs: drawn ? Object.fromEntries(Object.entries(node.attrs).filter(([name]) => !DRAWINGS.has(name))) : node.attrs,
+    children: node.children.map(withoutDrawings),
+  };
+}
+
+/** Keeps the island's state at `time`, without its canvases' drawings, if it is not the one before it. */
+export function recordIsland(path: string, time: number, drawn: RequestNode): void {
   if (!recording || windowSeconds === 0) return;
+  const root = withoutDrawings(drawn);
   const json = JSON.stringify(root);
   if (lastJson.get(path) === json) return;
   lastJson.set(path, json);
