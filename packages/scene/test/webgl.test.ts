@@ -542,15 +542,32 @@ describe('the recording WebGL context', () => {
       expect(draws(gl)[3]!.target).not.toBe(first!.target);
     });
 
-    it('starts each frame with its textures empty', () => {
+    it('keeps what earlier frames drew in a texture a frame samples, as a browser does, but nothing a clear covers', () => {
       const { gl } = setup();
-      attach(gl, 4, 2);
+      const { texture, framebuffer } = attach(gl, 4, 2);
       gl.drawArrays(GL.TRIANGLES, 0, 3);
+      const drawn = draws(gl)[0]!;
+      // A frame that draws in it without sampling it records only its own draw.
       gl.resetState();
       gl.drawArrays(GL.TRIANGLES, 0, 3);
-      const content = gl.content();
-      expect(content.ops).toHaveLength(1);
-      expect(Object.keys(content.textures)).toEqual([draws(gl)[0]!.target]);
+      expect(gl.content().ops).toHaveLength(1);
+      // A frame that samples it and draws nothing in it records the draws that filled it first.
+      gl.resetState();
+      gl.bindFramebuffer(GL.FRAMEBUFFER, null);
+      gl.bindTexture(GL.TEXTURE_2D, texture);
+      gl.drawArrays(GL.TRIANGLES, 0, 3);
+      expect(gl.content().ops.map((op) => [op.op, op.target ?? null])).toEqual([['draw', drawn.target], ['draw', drawn.target], ['draw', null]]);
+      expect(gl.content().programs[drawn.program]).toBeDefined();
+      // Cleared since, it holds nothing drawn before the clear: the frames after it record the clear alone.
+      gl.resetState();
+      gl.bindFramebuffer(GL.FRAMEBUFFER, framebuffer);
+      gl.clear(GL.COLOR_BUFFER_BIT);
+      gl.bindFramebuffer(GL.FRAMEBUFFER, null);
+      gl.drawArrays(GL.TRIANGLES, 0, 3);
+      expect(gl.content().ops.map((op) => op.op)).toEqual(['clear', 'draw']);
+      gl.resetState();
+      gl.drawArrays(GL.TRIANGLES, 0, 3);
+      expect(gl.content().ops.map((op) => [op.op, op.target ?? null])).toEqual([['clear', drawn.target], ['draw', null]]);
     });
 
     it('reports an incomplete framebuffer and draws nothing into it', () => {

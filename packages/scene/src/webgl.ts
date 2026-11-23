@@ -11,7 +11,7 @@
 // `WebGLUnsupportedError` whose message starts with "unsupported:" and says what to do instead; a call is never
 // accepted and then ignored where it would change the picture.
 
-import type { CanvasSource, GlslContent, GlslDraw, GlslLayer, GlslOp, GlslOutput, GlslPatch, GlslSampler, GlslStencil, GlslStencilFace, GlslTexture, GlslUniform } from './types.js';
+import type { CanvasSource, GlslContent, GlslDraw, GlslLayer, GlslOp, GlslOutput, GlslPatch, GlslProgram, GlslSampler, GlslStencil, GlslStencilFace, GlslTexture, GlslUniform } from './types.js';
 import { CANVAS_SOURCE, pictureOf, type CanvasPicture } from './canvas.js';
 import { preprocess } from './glsl-cpp.js';
 
@@ -970,6 +970,94 @@ function isCanvasOp(op: GlslOp): boolean {
 }
 
 /**
+ * An op of an earlier recording that drew in render targets, with what it names. A texture keeps what was drawn in it
+ * from one frame to the next, as in a browser (three renders an environment's PMREM once, then samples it every
+ * frame), while each recording is replayed on its own: a frame that samples such a texture replays the ops that
+ * drew it first.
+ */
+interface DrawnBefore {
+  readonly op: GlslOp;
+  /** The levels it draws in (`target@level`), and of those, the ones it leaves nothing drawn before it in. */
+  readonly writes: readonly string[];
+  readonly covers: readonly string[];
+  /** The levels its draws and blits read. */
+  readonly reads: readonly string[];
+  readonly programs: readonly (readonly [string, Required<GlslProgram>])[];
+  readonly buffers: readonly (readonly [string, string])[];
+  readonly textures: readonly (readonly [string, GlslTexture])[];
+  /** Why another frame cannot replay it: it read what only its own frame had. */
+  readonly bound?: string;
+}
+
+const level = (id: string, at = 0) => `${id}@${at}`;
+
+/** Every level of the target `id`. */
+function levelsOf(id: string, textures: ReadonlyMap<string, GlslTexture>): string[] {
+  return Array.from({ length: textures.get(id)?.levels ?? 1 }, (_, at) => level(id, at));
+}
+
+/** The levels of targets an op draws in. */
+function writesOf(op: GlslOp): string[] {
+  if (op.op === 'upload') return [level(op.target)];
+  if (op.op === 'blit') return op.target === undefined ? [] : [level(op.target, op.level)];
+  const colour = [...(op.target === undefined ? [] : [level(op.target, op.level)]), ...(op.outputs ?? []).flatMap((o) => (o === null ? [] : [level(o.target, o.level)]))];
+  return [...new Set([...colour, ...(op.depthStencil === undefined ? [] : [level(op.depthStencil)])])];
+}
+
+/** The levels an op leaves nothing drawn before it in: those a clear takes whole, and those a blit fills from corner to corner. */
+function coversOf(op: GlslOp, textures: ReadonlyMap<string, GlslTexture>): string[] {
+  if (op.op === 'clear') {
+    const colour = op.color === undefined ? [] : [...(op.target === undefined ? [] : [level(op.target, op.level)]), ...(op.outputs ?? []).flatMap((o) => (o === null ? [] : [level(o.target, o.level)]))];
+    const ds = op.depthStencil === undefined ? undefined : textures.get(op.depthStencil)?.format;
+    const depth = (ds === 'depth' && op.depth !== undefined) || (ds === 'stencil' && op.stencil !== undefined) || (ds === 'depthStencil' && op.depth !== undefined && op.stencil !== undefined);
+    return [...colour, ...(depth ? [level(op.depthStencil!)] : [])];
+  }
+  if (op.op === 'blit' && op.target !== undefined && op.scissor === undefined && op.aspect === undefined) {
+    const json = textures.get(op.target);
+    const at = op.level ?? 0;
+    const [x0, y0, x1, y1] = op.to;
+    const whole = json?.width !== undefined && json.height !== undefined && Math.min(x0, x1) <= 0 && Math.min(y0, y1) <= 0 && Math.max(x0, x1) >= Math.max(1, json.width >> at) && Math.max(y0, y1) >= Math.max(1, json.height >> at);
+    return whole ? [level(op.target, at)] : [];
+  }
+  return [];
+}
+
+/** The levels of targets an op reads: every level of a target (or of a cube of targets) its draw samples, and a blit's source. */
+function readsOf(op: GlslOp, textures: ReadonlyMap<string, GlslTexture>): string[] {
+  if (op.op === 'blit') return op.src === undefined ? [] : [level(op.src, op.srcLevel)];
+  if (op.op !== 'draw') return [];
+  return Object.values(op.units).flatMap(({ texture }) => {
+    const json = textures.get(texture);
+    if (json?.target === true) return levelsOf(texture, textures);
+    return json?.targets?.flatMap((face) => levelsOf(face, textures)) ?? [];
+  });
+}
+
+/** The textures an op names, as the recording's `textures` holds them: what it samples (a cube with its faces) and draws in. */
+function texturesOf(op: GlslOp, textures: ReadonlyMap<string, GlslTexture>): string[] {
+  const outputs = op.op === 'clear' || op.op === 'draw' ? [op.target, ...(op.outputs ?? []).map((o) => o?.target), op.depthStencil] : op.op === 'blit' ? [op.src, op.target] : [op.target];
+  const sampled = op.op === 'draw' ? Object.values(op.units).flatMap(({ texture }) => [texture, ...(textures.get(texture)?.targets ?? [])]) : [];
+  return [...new Set([...outputs, ...sampled].filter((id): id is string => id !== undefined))];
+}
+
+/**
+ * The ops of `before` that leave what `needed` reads in the levels it names, in their order: walking back, an op that
+ * draws in a needed level is kept and what it reads is needed too, until an op that covers the level leaves nothing
+ * before it to need.
+ */
+function replayed(before: readonly DrawnBefore[], needed: Set<string>): DrawnBefore[] {
+  const kept: DrawnBefore[] = [];
+  for (let i = before.length - 1; i >= 0 && needed.size > 0; i--) {
+    const drawn = before[i]!;
+    if (!drawn.writes.some((at) => needed.has(at))) continue;
+    kept.push(drawn);
+    for (const at of drawn.covers) needed.delete(at);
+    for (const at of drawn.reads) needed.add(at);
+  }
+  return kept.reverse();
+}
+
+/**
  * `WebGLRenderingContext` (and, with `version: 2`, the `WebGL2RenderingContext` calls shader pages use) as a recorder.
  * `content()` is what the `glsl` layer is made of. A context keeps its objects (programs, buffers, textures) and its
  * state between frames as a browser's does; the drawing buffer is emptied by `resetState()` (the frame loop calls it
@@ -1027,9 +1115,13 @@ export class WebGLContext {
   private unpackAlignment = 4;
 
   // What the ops refer to, by id.
-  private readonly programs = new Map<string, { vertex: string; fragment: string; attributes: Record<string, number> }>();
+  private readonly programs = new Map<string, Required<GlslProgram>>();
   private readonly buffers = new Map<string, string>();
   private readonly textures = new Map<string, GlslTexture>();
+  /** The ops of earlier recordings that drew what a target that can still be sampled holds (`keep`). */
+  private drawnBefore: DrawnBefore[] = [];
+  /** The texture or renderbuffer of each target id, at the version the id names, with its levels. */
+  private readonly targetsOwned = new Map<string, { owner: WebGLTexture | WebGLRenderbuffer; version: number; levels: number }>();
 
   constructor(options: WebGLContextOptions) {
     this.options = options;
@@ -1052,17 +1144,76 @@ export class WebGLContext {
 
   /** The recording: what the `glsl` layer holds. */
   content(): GlslContent {
+    const programs = new Map(this.programs);
+    const buffers = new Map(this.buffers);
+    const textures = new Map(this.textures);
+    const carried = replayed(this.drawnBefore, this.sampled());
+    for (const drawn of carried) {
+      if (drawn.bound !== undefined) throw new WebGLUnsupportedError(`sampling a texture an earlier frame drew in from ${drawn.bound}; draw it again in the frame that samples it`);
+      for (const [id, json] of drawn.programs) if (!programs.has(id)) programs.set(id, json);
+      for (const [id, base64] of drawn.buffers) if (!buffers.has(id)) buffers.set(id, base64);
+      for (const [id, json] of drawn.textures) if (!textures.has(id)) textures.set(id, json);
+    }
     return {
       premultipliedAlpha: this.attributes.premultipliedAlpha,
       alpha: this.attributes.alpha,
       ...(this.attributes.depth ? {} : { depth: false }),
       ...(this.attributes.stencil ? { stencil: true } : {}),
       ...(this.attributes.antialias ? { antialias: true } : {}),
-      programs: Object.fromEntries(this.programs),
-      buffers: Object.fromEntries(this.buffers),
-      textures: Object.fromEntries(this.textures),
-      ops: this.ops,
+      programs: Object.fromEntries(programs),
+      buffers: Object.fromEntries(buffers),
+      textures: Object.fromEntries(textures),
+      ops: carried.length === 0 ? this.ops : [...carried.map((drawn) => drawn.op), ...this.ops],
     };
+  }
+
+  /** The levels of targets this recording's ops read before they cover them: what earlier recordings drew in them. */
+  private sampled(): Set<string> {
+    const needed = new Set<string>();
+    for (let i = this.ops.length - 1; i >= 0; i--) {
+      const op = this.ops[i]!;
+      for (const at of coversOf(op, this.textures)) needed.delete(at);
+      for (const at of readsOf(op, this.textures)) needed.add(at);
+    }
+    return needed;
+  }
+
+  /**
+   * Keeps the ops of the recording that drew in targets, with what they name, for later frames that sample those
+   * targets; and lets go of every op kept before that no target still able to be sampled depends on.
+   */
+  private keep(): void {
+    for (const op of this.ops) {
+      const writes = writesOf(op);
+      if (writes.length === 0) continue;
+      const named = texturesOf(op, this.textures);
+      const textures = named.flatMap((id) => {
+        const json = this.textures.get(id);
+        return json === undefined ? [] : [[id, json] as const];
+      });
+      const buffers = op.op === 'draw' ? [...Object.values(op.attributes).map((a) => a.buffer), ...(op.indices === undefined ? [] : [op.indices.buffer])].flatMap((id) => {
+        const base64 = this.buffers.get(id);
+        return base64 === undefined ? [] : [[id, base64] as const];
+      }) : [];
+      const program = op.op === 'draw' ? this.programs.get(op.program) : undefined;
+      const bound = op.op === 'blit' && op.src === undefined ? 'the drawing buffer' : (op.op === 'upload' && op.layer !== undefined) || textures.some(([, json]) => json.layer !== undefined || json.patches?.some((p) => p.layer !== undefined)) ? 'a layer' : undefined;
+      this.drawnBefore.push({
+        op,
+        writes,
+        covers: coversOf(op, this.textures),
+        reads: readsOf(op, this.textures),
+        programs: program === undefined || op.op !== 'draw' ? [] : [[op.program, program]],
+        buffers,
+        textures,
+        ...(bound === undefined ? {} : { bound }),
+      });
+    }
+    const live = new Set<string>();
+    for (const [id, { owner, version, levels }] of this.targetsOwned) {
+      if (owner.deleted || owner.version !== version) this.targetsOwned.delete(id);
+      else for (let at = 0; at < levels; at++) live.add(level(id, at));
+    }
+    this.drawnBefore = replayed(this.drawnBefore, live);
   }
 
   /** Whether anything was drawn or cleared. */
@@ -1078,12 +1229,14 @@ export class WebGLContext {
    * draws nothing draws nothing.
    */
   resetState(): void {
+    if (!this.stale) this.keep();
     this.stale = true;
     this.ops = [];
   }
 
   /** Empties the drawing buffer (`canvas.width` was set). */
   reset(): void {
+    if (!this.stale) this.keep();
     this.ops = [];
     this.programs.clear();
     this.buffers.clear();
@@ -3033,6 +3186,7 @@ export class WebGLContext {
   /** A texture a framebuffer draws in, as the recording names it: its size, by an id that changes when it is specified again. */
   private registerTarget(texture: WebGLTexture): string {
     const id = `f${texture.id}.${texture.version}`;
+    this.targetsOwned.set(id, { owner: texture, version: texture.version, levels: Math.max(1, texture.levels) });
     const kind = kindOf(texture.format);
     this.textures.set(id, {
       target: true,
@@ -3055,6 +3209,7 @@ export class WebGLContext {
     }
     const r = a.renderbuffer;
     const id = `r${r.id}.${r.version}`;
+    this.targetsOwned.set(id, { owner: r, version: r.version, levels: 1 });
     const kind = kindOf(r.format ?? 0);
     const colorFormat = COLOR_TARGETS[r.format ?? 0];
     this.textures.set(id, { target: true, width: r.width, height: r.height, ...(kind === 'color' ? {} : { format: kind }), ...(colorFormat !== undefined ? { colorFormat } : {}), ...(r.samples > 0 ? { samples: r.samples } : {}) });
