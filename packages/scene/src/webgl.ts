@@ -2666,7 +2666,6 @@ export class WebGLContext {
   private subFloats(texture: WebGLTexture, xoffset: number, yoffset: number, rest: unknown[]): void {
     const float = FLOAT_FORMATS[texture.format]!;
     if (rest.length < 5) throw new WebGLUnsupportedError('texSubImage2D into a float texture from a picture; use an array of floats');
-    if (this.flipY || this.premultiply) throw new WebGLUnsupportedError('texSubImage2D into a float texture with UNPACK_FLIP_Y_WEBGL or UNPACK_PREMULTIPLY_ALPHA_WEBGL on');
     if (texture.drawnAt === texture.version) throw new WebGLUnsupportedError('texSubImage2D into a float texture a framebuffer drew in; draw into it, or upload the whole texture again');
     const [width, height, format, type, source, srcOffset = 0] = rest as [number, number, number, number, ArrayBufferView | null, number | undefined];
     const numbers = [xoffset, yoffset, width, height];
@@ -2674,8 +2673,18 @@ export class WebGLContext {
     if (source === null || source === undefined) return this.fail(GL.INVALID_VALUE);
     const floats = this.floatTexels(float, format, type, width * height, source, Number(srcOffset));
     if (floats === null) return;
+    // UNPACK_PREMULTIPLY_ALPHA_WEBGL and UNPACK_FLIP_Y_WEBGL apply to the floats as in `specifyFloat`: flip-Y turns the
+    // rectangle's rows over (three.js uploads an HDR's floats this way).
+    if (this.premultiply) {
+      for (let i = 0; i < width * height; i += 1) {
+        for (let c = 0; c < 3; c += 1) floats[i * 4 + c]! *= floats[i * 4 + 3]!;
+      }
+    }
     const held = texture.floats!;
-    for (let y = 0; y < height; y += 1) held.set(floats.subarray(y * width * 4, (y + 1) * width * 4), ((yoffset + y) * texture.width + xoffset) * 4);
+    for (let y = 0; y < height; y += 1) {
+      const row = this.flipY ? height - 1 - y : y;
+      held.set(floats.subarray(row * width * 4, (row + 1) * width * 4), ((yoffset + y) * texture.width + xoffset) * 4);
+    }
     texture.blank = false;
     texture.version += 1;
   }
