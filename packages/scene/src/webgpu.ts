@@ -558,6 +558,8 @@ export class GPUTextureShim extends GpuObject {
   readonly uid: number;
   readonly bytes: number;
   destroyed = false;
+  /** The canvas this texture stands in for this frame (`GPUCanvasContextShim.target`), or null. */
+  backs: GPUCanvasContextShim | null = null;
   constructor(
     readonly device: GPUDeviceShim,
     readonly canvas: GPUCanvasContextShim | null,
@@ -882,12 +884,14 @@ function colorOf(value: unknown): [number, number, number, number] {
 
 /** `{ texture, mipLevel, origin }` of a copy, checked against the texture. */
 function regionOf(call: string, what: string, info: { texture: GPUTextureShim; mipLevel?: number; origin?: unknown; aspect?: string }, width: number, height: number, depth: number, usage: number, usageName: string): TextureRegion {
-  const texture = info?.texture;
-  if (!(texture instanceof GPUTextureShim)) throw new TypeError(`${call}: ${what} texture is not a GPUTexture`);
-  if (texture.canvas !== null) throw texture.device.unsupported(`${call} with the canvas's texture`);
+  const given = info?.texture;
+  if (!(given instanceof GPUTextureShim)) throw new TypeError(`${call}: ${what} texture is not a GPUTexture`);
+  const texture = given.canvas === null ? given : given.canvas.target();
+  if (texture === null) throw given.device.unsupported(`${call} with the canvas's texture; configure the canvas with GPUTextureUsage.COPY_DST, TEXTURE_BINDING or STORAGE_BINDING`);
   if (texture.destroyed) throw new Error(`OperationError: ${call}: the ${what} texture was destroyed`);
   if (texture.sampleCount > 1) throw new RangeError(`OperationError: ${call}: the ${what} texture is multisampled; resolve it into a texture first`);
-  if ((texture.usage & usage) === 0) throw new RangeError(`OperationError: ${call}: the ${what} texture was made without GPUTextureUsage.${usageName}`);
+  // The canvas's usages are its configuration's, whatever its stand-in has.
+  if ((given.usage & usage) === 0) throw new RangeError(`OperationError: ${call}: the ${what} texture was made without GPUTextureUsage.${usageName}`);
   if (info.aspect !== undefined && info.aspect !== 'all') throw texture.device.unsupported(`${call} of the aspect ${info.aspect}`);
   const mip = whole(call, 'mipLevel', info.mipLevel ?? 0, 0);
   if (mip >= texture.mipLevelCount) throw new RangeError(`OperationError: ${call}: mip level ${mip} of a texture with ${texture.mipLevelCount}`);
@@ -920,8 +924,9 @@ export class GPUCommandEncoderShim extends GpuObject {
     const view = attachment.view;
     if (!(view instanceof GPUTextureViewShim)) throw new TypeError('beginRenderPass: the colour attachment has no view');
     const clear = (attachment.loadOp ?? 'clear') === 'load' ? null : colorOf(attachment.clearValue);
-    const texture = view.texture;
-    if (texture.canvas !== null) return new GPURenderPassEncoderShim(this, { context: texture.canvas, texture: null, mip: 0, clear });
+    // A canvas used as more than a render attachment is drawn into the texture that stands in for it this frame.
+    const texture = view.texture.canvas === null ? view.texture : view.texture.canvas.target();
+    if (texture === null) return new GPURenderPassEncoderShim(this, { context: view.texture.canvas, texture: null, mip: 0, clear });
     if (texture.destroyed) throw new Error('OperationError: beginRenderPass: the texture was destroyed');
     if ((texture.usage & GPU_TEXTURE_USAGE.RENDER_ATTACHMENT) === 0) throw new RangeError('OperationError: beginRenderPass: the texture was made without GPUTextureUsage.RENDER_ATTACHMENT');
     if (view.mips !== 1) throw new RangeError('OperationError: beginRenderPass: a colour attachment is one mip level');
@@ -929,7 +934,7 @@ export class GPUCommandEncoderShim extends GpuObject {
     let resolve: Attachment['resolve'];
     if (resolveTarget) {
       if (!(resolveTarget instanceof GPUTextureViewShim)) throw new TypeError('beginRenderPass: the resolve target has no view');
-      const to = resolveTarget.texture;
+      const to = resolveTarget.texture.canvas === null ? resolveTarget.texture : (resolveTarget.texture.canvas.target() ?? resolveTarget.texture);
       if (texture.sampleCount === 1) throw new TypeError('OperationError: beginRenderPass: a resolve target needs a multisampled colour attachment');
       if (to.canvas !== null) throw this.device.unsupported("a resolve target that is the canvas's texture; resolve into a texture of your own");
       if (to.destroyed) throw new Error('OperationError: beginRenderPass: the resolve target was destroyed');
@@ -940,7 +945,7 @@ export class GPUCommandEncoderShim extends GpuObject {
       if ((to.usage & GPU_TEXTURE_USAGE.RENDER_ATTACHMENT) === 0) throw new RangeError('OperationError: beginRenderPass: the resolve target was made without GPUTextureUsage.RENDER_ATTACHMENT');
       resolve = { texture: to, mip: resolveTarget.baseMip };
     }
-    return new GPURenderPassEncoderShim(this, { context: null, texture, mip: view.baseMip, clear, ...(resolve ? { resolve } : {}) });
+    return new GPURenderPassEncoderShim(this, { context: null, texture, mip: texture === view.texture ? view.baseMip : 0, clear, ...(resolve ? { resolve } : {}) });
   }
   beginComputePass(descriptor?: { label?: string; timestampWrites?: unknown }): GPUComputePassEncoderShim {
     if (descriptor?.timestampWrites) throw this.device.unsupported('timestampWrites on a compute pass (query sets)');
@@ -1049,9 +1054,26 @@ export interface GPUCanvasContextOptions {
   canvas?: unknown;
 }
 
+/** The usages beyond drawing into it that make a canvas stand in a texture of its own (`GPUCanvasContextShim.target`). */
+const BACKED_USAGE = GPU_TEXTURE_USAGE.STORAGE_BINDING | GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST;
+
+/** Draws a texture into the canvas, texel for texel: how a canvas's stand-in reaches the picture. */
+const PRESENT_WGSL = `
+@group(0) @binding(0) var picture: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+  return vec4f(p[i], 0, 1);
+}
+@fragment fn fs(@builtin(position) at: vec4f) -> @location(0) vec4f { return textureLoad(picture, vec2i(at.xy), 0); }`;
+
 /**
  * `canvas.getContext('webgpu')`. `content()` is what the `glsl` layer is made of. Like a browser's canvas it presents once
  * a frame: the first submit after `resetState()` (the frame loop calls it before a frame) starts the drawing afresh.
+ *
+ * The recording draws into a canvas only with render passes. A canvas configured to be bound, sampled or copied into
+ * (`usage` with STORAGE_BINDING, TEXTURE_BINDING or COPY_DST) has a texture that stands in for it each frame, as a
+ * browser's current texture is a new one each frame: everything done to the canvas's texture is done to it, and each
+ * submit that wrote it draws it into the canvas.
  */
 export class GPUCanvasContextShim {
   readonly canvas: unknown;
@@ -1061,7 +1083,13 @@ export class GPUCanvasContextShim {
   private format = 'rgba8unorm';
   private colorSpace: 'srgb' | 'display-p3' = 'srgb';
   private alphaMode = 'opaque';
+  private usage = GPU_TEXTURE_USAGE.RENDER_ATTACHMENT;
   private stale = false;
+  /** This frame's stand-in (`target`), made when first used. */
+  private backing: GPUTextureShim | null = null;
+  /** Earlier frames' stand-ins: what the picture holds until the next frame's drawing starts, then destroyed. */
+  private retired: GPUTextureShim[] = [];
+  private presenter: { device: GPUDeviceShim; format: string; pipeline: GPURenderPipelineShim } | null = null;
 
   constructor(private readonly options: GPUCanvasContextOptions) {
     this.canvas = options.canvas;
@@ -1077,6 +1105,13 @@ export class GPUCanvasContextShim {
     // The video is SDR: an extended canvas is drawn as a standard one, its values clipped to 0..1 as the standard mode does.
     const toneMapping = (configuration.toneMapping as { mode?: string } | undefined)?.mode ?? 'standard';
     if (toneMapping === 'extended' && format === 'rgba16float') device.note('canvas toneMapping extended (drawn as standard: values above 1 are clipped, the video being SDR)');
+    const usage = whole('configure', 'usage', configuration.usage ?? GPU_TEXTURE_USAGE.RENDER_ATTACHMENT, 0);
+    if (usage === 0 || usage > 31) throw new RangeError(`OperationError: configure: usage ${usage} is not a combination of GPUTextureUsage flags`);
+    if (usage & GPU_TEXTURE_USAGE.STORAGE_BINDING && FORMATS[format]!.storage === 'none') {
+      throw new TypeError(`OperationError: configure: a ${format} canvas cannot have GPUTextureUsage.STORAGE_BINDING (it needs an optional feature)`);
+    }
+    this.retire();
+    this.usage = usage;
     this.device = device;
     this.drawnBy = device;
     this.format = format;
@@ -1096,7 +1131,44 @@ export class GPUCanvasContextShim {
   getCurrentTexture(): GPUTextureShim {
     if (this.device === null) throw new Error('InvalidStateError: the canvas context is not configured');
     const { width, height } = this.options.size();
-    return new GPUTextureShim(this.device, this, Math.max(1, width), Math.max(1, height), this.format, GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.COPY_SRC, 1);
+    return new GPUTextureShim(this.device, this, Math.max(1, width), Math.max(1, height), this.format, this.usage | GPU_TEXTURE_USAGE.COPY_SRC, 1);
+  }
+
+  /**
+   * The texture that stands in for the canvas's this frame, made on first use, when the canvas is configured to be used
+   * as more than a render attachment; null when render passes draw into the canvas itself.
+   */
+  target(): GPUTextureShim | null {
+    if (this.device === null || (this.usage & BACKED_USAGE) === 0) return null;
+    if (this.backing === null) {
+      const { width, height } = this.options.size();
+      const all = GPU_TEXTURE_USAGE.COPY_SRC | GPU_TEXTURE_USAGE.COPY_DST | GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.RENDER_ATTACHMENT;
+      const storage = FORMATS[this.format]!.storage === 'none' ? 0 : GPU_TEXTURE_USAGE.STORAGE_BINDING;
+      this.backing = new GPUTextureShim(this.device, null, Math.max(1, width), Math.max(1, height), this.format, all | storage, 1, 'canvas');
+      this.backing.backs = this;
+    }
+    return this.backing;
+  }
+
+  /** A submit wrote `texture`: if it is this frame's stand-in, the canvas's picture is it, drawn into the canvas. */
+  present(texture: GPUTextureShim): void {
+    const device = this.device;
+    if (device === null || texture !== this.backing) return;
+    this.begin();
+    // The canvas holds one picture of its stand-in: the last.
+    device.dropFrameOf(this);
+    if (this.presenter?.device !== device || this.presenter.format !== this.format) {
+      const module = device.createShaderModule({ code: PRESENT_WGSL });
+      const pipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format: this.format }] } });
+      this.presenter = { device, format: this.format, pipeline };
+    }
+    const { pipeline } = this.presenter;
+    const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: texture.createView() }] });
+    device.encodePass({ context: this, texture: null, mip: 0, clear: [0, 0, 0, 0] }, [
+      { c: 'pipeline', pipeline },
+      { c: 'bind', index: 0, group },
+      { c: 'draw', vertices: 3, instances: 1, first: 0, firstInstance: 0 },
+    ]);
   }
 
   /** The device submitted a pass for this canvas: starts the frame's drawing if it is a new one. */
@@ -1104,6 +1176,15 @@ export class GPUCanvasContextShim {
     if (!this.stale) return;
     this.stale = false;
     this.drawnBy?.dropFrameOf(this);
+    // The last frame's picture went with its passes: so do the stand-ins it drew.
+    for (const texture of this.retired.splice(0)) texture.destroy();
+  }
+
+  /** This frame's stand-in is done with: the next use makes a new one. */
+  private retire(): void {
+    if (this.backing === null) return;
+    this.retired.push(this.backing);
+    this.backing = null;
   }
 
   /** The recording: what the `glsl` layer holds. */
@@ -1158,12 +1239,14 @@ export class GPUCanvasContextShim {
   /** The frame loop calls this before each frame: the next submit starts a new drawing; a frame that draws nothing keeps the picture. */
   resetState(): void {
     this.stale = true;
+    this.retire();
     this.drawnBy?.frameStarted();
   }
 
   /** Empties the drawing (`canvas.width` was set). */
   reset(): void {
     this.stale = true;
+    this.retire();
     this.begin();
   }
 }
@@ -1253,6 +1336,7 @@ export class GPUQueueShim extends GpuObject {
         }
       }
     }
+    this.device.present();
   }
   onSubmittedWorkDone(): Promise<void> {
     return Promise.resolve();
@@ -1280,6 +1364,7 @@ export class GPUQueueShim extends GpuObject {
       throw new RangeError(`OperationError: ${call}: the copy reads past the ${bytes.byteLength} bytes of the data`);
     }
     this.device.uploadBytes(to, extent.width, extent.height, bytes, offset, bytesPerRow);
+    this.device.present();
   }
   /** `copyExternalImageToTexture({ source, origin, flipY }, { texture, mipLevel, origin, premultipliedAlpha, colorSpace }, copySize)`. */
   copyExternalImageToTexture(
@@ -1313,6 +1398,7 @@ export class GPUQueueShim extends GpuObject {
       ...(destination.premultipliedAlpha ? { premultiply: true } : {}),
     };
     this.device.append({ step, canvas: null, tables, textures: new Set([to.texture]), reads: new Set(), writes: this.device.writesOf(to, extent.width, extent.height) });
+    this.device.present();
   }
 }
 
@@ -1338,6 +1424,8 @@ export class GPUDeviceShim extends EventTarget {
   private worked = false;
   /** What the queue did, in order: the frame's passes into canvases, and the steps that wrote textures. */
   private steps: LogStep[] = [];
+  /** The canvases' stand-ins (`GPUCanvasContextShim.target`) written since the queue last presented them. */
+  private written = new Set<GPUTextureShim>();
 
   constructor(readonly options: GpuOptions = {}, limits?: Record<string, number>) {
     super();
@@ -1445,6 +1533,7 @@ export class GPUDeviceShim extends EventTarget {
   append(entry: LogStep): void {
     entry.frame = this.frame;
     this.worked = true;
+    for (const w of entry.writes) if (w.owner instanceof GPUTextureShim && w.owner.backs !== null) this.written.add(w.owner);
     // A part-write keeps what it does not write: it reads it.
     for (const w of entry.writes) if (!w.whole) entry.reads.add(w.key);
     this.steps.push(entry);
@@ -1468,6 +1557,12 @@ export class GPUDeviceShim extends EventTarget {
       this.note(`more than ${MAX_STEPS} queued steps into textures and buffers (the oldest are dropped; clear or overwrite them each frame)`);
       this.steps.splice(0, this.steps.length - MAX_STEPS);
     }
+  }
+  /** The queue's work is done: each canvas whose stand-in it wrote draws it. */
+  present(): void {
+    const written = [...this.written];
+    this.written.clear();
+    for (const texture of written) texture.backs?.present(texture);
   }
   /** What a write of `width` x `height` at a region of its level changes. */
   writesOf(to: TextureRegion, width: number, height: number): LogWrite[] {
@@ -1846,7 +1941,8 @@ export class GPUDeviceShim extends EventTarget {
       const resource = e.resource;
       const layoutEntry = descriptor.layout.id.startsWith('auto:') ? undefined : descriptor.layout.entries.find((x) => x.binding === e.binding);
       if (resource instanceof GPUTextureViewShim) {
-        if (resource.texture.canvas !== null) throw this.unsupported("a bind group with the canvas's texture; render into a texture of your own to sample it");
+        const stands = resource.texture.canvas?.target() ?? null;
+        if (resource.texture.canvas !== null && stands === null) throw this.unsupported("a bind group with the canvas's texture; configure the canvas with GPUTextureUsage.TEXTURE_BINDING or STORAGE_BINDING, or render into a texture of your own");
         if (resource.texture.destroyed) throw new Error('OperationError: createBindGroup: the texture was destroyed');
         if (resource.texture.sampleCount > 1) throw this.unsupported('a bind group with a multisampled texture; resolve it into a texture and sample that');
         const storage = layoutEntry?.type === 'storage-texture';
@@ -1867,7 +1963,7 @@ export class GPUDeviceShim extends EventTarget {
             );
           }
         }
-        entries.push({ binding: e.binding, view: resource });
+        entries.push({ binding: e.binding, view: stands === null ? resource : stands.createView() });
       } else if (resource instanceof GPUSamplerShim) {
         entries.push({ binding: e.binding, sampler: resource });
       } else {
