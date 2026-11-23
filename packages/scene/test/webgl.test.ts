@@ -939,6 +939,16 @@ describe('the recording WebGL context', () => {
         { x: 0, y: 0, width: 1, height: 1, pixels: Buffer.from([1, 2, 3, 4]).toString('base64') },
       ]);
 
+      // Over the whole texture, as three.js fills a texStorage2D with a canvas, it is the picture: nothing of what the texture held is kept.
+      const filled = gl.createTexture();
+      gl.bindTexture(GL.TEXTURE_2D, filled);
+      gl.texStorage2D(GL.TEXTURE_2D, 1, GL2.RGBA8, 4, 2);
+      gl.pixelStorei(GL.UNPACK_FLIP_Y_WEBGL, true);
+      const picture = new Uint8Array(32).fill(7);
+      gl.texSubImage2D(GL.TEXTURE_2D, 0, 0, 0, 4, 2, GL.RGBA, GL.UNSIGNED_BYTE, picture);
+      gl.drawArrays(GL.TRIANGLES, 0, 3);
+      expect(gl.content().textures[draws(gl)[1]!.units['0']!.texture]).toEqual({ pixels: Buffer.from(picture).toString('base64'), width: 4, height: 2, flipY: true });
+
       // Into a texture a framebuffer drew in: an op after the draws.
       const target = gl.createTexture();
       gl.bindTexture(GL.TEXTURE_2D, target);

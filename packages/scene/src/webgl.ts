@@ -2893,12 +2893,12 @@ export class WebGLContext {
     }
     if (xoffset < 0 || yoffset < 0 || xoffset + width > texture.width || yoffset + height > texture.height) return this.fail(GL.INVALID_VALUE);
     const flags = { ...(this.flipY ? { flipY: true } : {}), ...(this.premultiply ? { premultiply: true } : {}) };
-    const json = 'pixels' in part ? { pixels: toBase64(part.pixels) } : part;
+    const json = () => ('pixels' in part ? { pixels: toBase64(part.pixels) } : part);
     if (texture.drawnAt === texture.version) {
       // The bytes of an upload are RGBA8, which an R8 or RG8 target does not hold.
       if (texture.format === GL2.R8 || texture.format === GL2.RG8) throw new WebGLUnsupportedError('texSubImage2D into an R8 or RG8 texture a framebuffer drew in; draw into it, or upload the whole texture again');
       this.begin();
-      this.ops.push({ op: 'upload', target: this.registerTarget(texture), x: xoffset, y: yoffset, width, height, ...json, ...flags });
+      this.ops.push({ op: 'upload', target: this.registerTarget(texture), x: xoffset, y: yoffset, width, height, ...json(), ...flags });
       return;
     }
     // Pixels over pixels held here, unflipped and premultiplied alike, are written in place.
@@ -2908,8 +2908,11 @@ export class WebGLContext {
       for (let y = 0; y < height; y += 1) {
         held.set(part.pixels.subarray(y * width * 4, (y + 1) * width * 4), ((yoffset + y) * texture.width + xoffset) * 4);
       }
+    } else if (xoffset === 0 && yoffset === 0 && width === texture.width && height === texture.height) {
+      // Over the whole texture (three.js fills a texStorage2D so), it is the texture's picture: nothing it held is left.
+      Object.assign(texture, { pixels: 'pixels' in part ? part.pixels : null, src: 'src' in part ? part.src : null, layer: 'layer' in part ? part.layer : null, flipY: this.flipY, premultiply: this.premultiply, patches: [] });
     } else {
-      texture.patches.push({ x: xoffset, y: yoffset, width, height, ...json, ...flags });
+      texture.patches.push({ x: xoffset, y: yoffset, width, height, ...json(), ...flags });
     }
     texture.blank = false;
     texture.version += 1;
