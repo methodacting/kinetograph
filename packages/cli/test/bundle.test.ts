@@ -1,6 +1,8 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { bundleProject, cacheDir, projectReactError, type UnsupportedImport, familyFromModule, resolveSpecifier, syntheticEntry } from '../src/bundle.js';
 import { CliError } from '../src/errors.js';
@@ -480,6 +482,41 @@ describe('bundleProject', () => {
       'node_modules/lib/index.js': `exports.v = require('not-installed');`,
     });
     await expect(bundleProject(join(dir, 'index.ts'))).rejects.toMatchObject({ code: 'BUNDLE_FAILED' });
+  });
+
+  // In Node, React's scheduler posted its work with `setImmediate`, which the frame loop does not see: a concurrent root's
+  // render (React Three Fiber's) took several turns, the frame looked quiet, and the page's watchdog timeout, a hold timer,
+  // was fired before the present. In the page it posts on the page's MessageChannel, as in a browser.
+  it("runs React's scheduler on the page's MessageChannel, so a frame waits for its work", async () => {
+    const dir = project({
+      'index.ts': [
+        `import { createElement } from 'react';`,
+        `import { Composition, continueRender, delayRender, registerRoot } from 'remotion';`,
+        `import { unstable_NormalPriority, unstable_scheduleCallback } from 'scheduler';`,
+        `const log: string[] = ((globalThis as { log?: string[] }).log = []);`,
+        `let started = false;`,
+        `function Page() {`,
+        `  if (!started) {`,
+        `    started = true;`,
+        `    const handle = delayRender('React work');`,
+        `    setTimeout(() => { log.push('watchdog:10000'); continueRender(handle); }, 10000);`,
+        // Each continuation is a turn of the scheduler's host loop.
+        `    let slices = 0;`,
+        `    const work = () => { if (++slices < 5) return work; log.push('presented'); continueRender(handle); return undefined; };`,
+        `    unstable_scheduleCallback(unstable_NormalPriority, work);`,
+        `  }`,
+        `  return null;`,
+        `}`,
+        `registerRoot(() => createElement(Composition, { id: 'T', component: Page, width: 4, height: 4, fps: 30, durationInFrames: 1 }));`,
+      ].join('\n'),
+    });
+    mkdirSync(join(dir, 'node_modules'), { recursive: true });
+    symlinkSync(dirname(createRequire(import.meta.url).resolve('scheduler/package.json')), join(dir, 'node_modules', 'scheduler'));
+    const { file } = await bundleProject(join(dir, 'index.ts'));
+    const run = `const m = await import(${JSON.stringify(file)}); await m.createFrameRenderer('T').renderFrame(0); console.log(JSON.stringify(globalThis.log));`;
+    const out = spawnSync(process.execPath, ['--input-type=module', '-e', run], { encoding: 'utf8', timeout: 60_000 });
+    expect(out.status, out.stderr).toBe(0);
+    expect(JSON.parse(out.stdout.trim().split('\n').at(-1) ?? 'null')).toEqual(['presented']);
   });
 });
 

@@ -271,6 +271,24 @@ function browserMapOf(dir: string): { root: string; map: Record<string, string |
   return found;
 }
 
+/** React's scheduler, the build `scheduler`'s entry requires (development or production). */
+const SCHEDULER_FILE = /[\\/]node_modules[\\/]scheduler[\\/]cjs[\\/]scheduler\.(development|production)\.js$/;
+
+/**
+ * React's scheduler posts its work as in a browser, on the page's `MessageChannel`. Given a `setImmediate` it takes that
+ * instead, and the frame loop does not see work posted that way: a concurrent root's render that takes several turns (React
+ * Three Fiber's) looked quiet, and a timeout the page set while the frame was held (its watchdog) was fired before the
+ * present. The page's `MessageChannel` delivers on the shim's queue, which the frame loop counts as moving.
+ */
+function schedulerPlugin(): Plugin {
+  return {
+    name: 'kinetograph-scheduler',
+    setup(b) {
+      b.onLoad({ filter: SCHEDULER_FILE }, (args) => ({ contents: `var setImmediate;\n${readFileSync(args.path, 'utf8')}`, loader: 'js' }));
+    },
+  };
+}
+
 /**
  * A package's `browser` map says which of its Node-only imports a browser leaves out (`"jsdom": false`) or swaps. The
  * bundle runs on Node, so a map is not applied while its import resolves; but one that does not (Paper.js's optional
@@ -427,7 +445,7 @@ export interface BundleResult {
 
 /** The esbuild options that bundle the project at `absolute` (packages/cli/skills/kinetograph-markup/references/AUTHORING.md §9). */
 function bundleOptions(absolute: string, unsupported?: UnsupportedImport[], dev = false, watched?: Watched): BuildOptions {
-  const plugins = [...(dev ? [jsxDevPlugin()] : []), entryPlugin(absolute), imagePlugin(), hyperframesPlugin(), aliasPlugin(unsupported), projectPeersPlugin(dirname(absolute)), gsapPlugin(), browserFieldPlugin(), cssPlugin()];
+  const plugins = [...(dev ? [jsxDevPlugin()] : []), entryPlugin(absolute), imagePlugin(), schedulerPlugin(), hyperframesPlugin(), aliasPlugin(unsupported), projectPeersPlugin(dirname(absolute)), gsapPlugin(), browserFieldPlugin(), cssPlugin()];
   return {
     stdin: {
       contents: syntheticEntry(absolute, dev),
