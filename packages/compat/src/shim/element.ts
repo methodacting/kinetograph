@@ -440,29 +440,33 @@ export class DomNodeBase {
     return ownerDocumentOf((this as unknown as { host: DomNode }).host);
   }
   // The tree links are `Node`'s too: Svelte's runtime takes the `firstChild` and `nextSibling` getters from
-  // `Node.prototype` once and calls them on every node. Each kind of node gives its own lists.
-  get childNodes(): NodeList<DomChildNode> {
+  // `Node.prototype` once and calls them on every node. Each kind of node gives its own lists; an XML document's nodes
+  // (xml.ts) keep their own links, so these are typed as any `Node`.
+  get childNodes(): NodeList<DomNodeBase> {
     return nodeListOf([]);
   }
-  get firstChild(): DomChildNode | null {
+  get firstChild(): DomNodeBase | null {
     return this.childNodes[0] ?? null;
   }
-  get lastChild(): DomChildNode | null {
+  get lastChild(): DomNodeBase | null {
     return this.childNodes.at(-1) ?? null;
   }
   /** The nodes next to this one (its parent's children), itself included; a node in no list has none. */
   protected siblingHosts(): DomNode[] {
     return [];
   }
-  get nextSibling(): DomChildNode | null {
-    const list = this.siblingHosts();
-    const next = list[list.indexOf((this as unknown as { host: DomNode }).host) + 1];
-    return next === undefined ? null : domNodeFor(next);
+  get nextSibling(): DomNodeBase | null {
+    return this.siblingAt(1);
   }
-  get previousSibling(): DomChildNode | null {
+  get previousSibling(): DomNodeBase | null {
+    return this.siblingAt(-1);
+  }
+  /** The node `offset` places from this one among its parent's children. */
+  protected siblingAt(offset: 1 | -1): DomChildNode | null {
     const list = this.siblingHosts();
     const at = list.indexOf((this as unknown as { host: DomNode }).host);
-    return at <= 0 ? null : domNodeFor(list[at - 1]!);
+    const sibling = at < 0 ? undefined : list[at + offset];
+    return sibling === undefined ? null : domNodeFor(sibling);
   }
 }
 
@@ -498,6 +502,12 @@ export function gestureListenerElements(): DomElement[] {
  */
 export abstract class DomChildNodeBase extends DomNodeBase {
   abstract readonly host: DomNode;
+  override get nextSibling(): DomChildNode | null {
+    return this.siblingAt(1);
+  }
+  override get previousSibling(): DomChildNode | null {
+    return this.siblingAt(-1);
+  }
   /** The element whose children this node is among; null when it has none. */
   protected abstract childNodeParent(): HostElement | null;
   /** Puts `nodes` in this node's parent, before it. */
