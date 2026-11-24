@@ -65,6 +65,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config nasm make git cmake
+          # Software Vulkan (lavapipe), for the compositor tests below on a runner with no GPU.
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -188,12 +190,39 @@ jobs:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
         run: cargo test --release --target ${{ matrix.target }} -p libmv-sys -p kinetograph-track -p kinetograph-matte --features kinetograph-track/ffmpeg-static,kinetograph-matte/ffmpeg-static -- --nocapture
 
+      # Fork only: the compositor's GLSL recordings (blob transport). The goldens were made on an M4 and compare exactly, so
+      # this runner first renders them at the commit before the blob work (BLOB_BASE, UPDATE_GOLDEN=1) and then compares
+      # the branch against those: the same pixels before and after, on this platform. Skia draws on the CPU on the Intel
+      # row (its virtual GPU has no MTLGPUFamily Graphite accepts); Linux draws on lavapipe. At BLOB_BASE core has no
+      # ffmpeg-static feature, so kinetograph-node is selected there for its own.
+      - name: Test the compositor's GLSL recordings (Intel macOS, Linux)
+        if: matrix.platform == 'darwin-x64' || matrix.platform == 'linux-x64-gnu'
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/ffmpeg/lib/pkgconfig
+          KINETOGRAPH_SKIA_CPU: ${{ matrix.platform == 'darwin-x64' && '1' || '' }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          BLOB_BASE: 6b0449662b332637b58f9d49d9a1d7a91c08b020
+        shell: bash
+        run: |
+          set -euo pipefail
+          t=${{ matrix.target }}
+          git fetch --no-tags --depth=1 origin "$BLOB_BASE"
+          git worktree add --detach "$RUNNER_TEMP/base" "$BLOB_BASE"
+          (cd "$RUNNER_TEMP/base" && UPDATE_GOLDEN=1 cargo test --release --target "$t" -p kinetograph-core -p kinetograph-dom -p kinetograph-node --features kinetograph-node/ffmpeg-static --test golden --test webgl)
+          cp "$RUNNER_TEMP"/base/crates/core/tests/golden/*.png crates/core/tests/golden/
+          cp "$RUNNER_TEMP"/base/crates/dom/tests/golden/*.png crates/dom/tests/golden/
+          echo "goldens this platform draws differently from the committed ones:"
+          git status --short crates/core/tests/golden crates/dom/tests/golden
+          cargo test --release --target "$t" -p kinetograph-core --features ffmpeg-static --lib --test glsl --test canvas_pass --test webgpu --test golden
+          cargo test --release --target "$t" -p kinetograph-dom --features kinetograph-core/ffmpeg-static --test webgl -- --nocapture
+
       # ONNX Runtime for the BEN2 step: Microsoft's CPU release, the version and SHA-256 that
       # packages/video-matting/src/registry.ts pins (users get it from the same release on the first use of matting). Its
       # CoreML is on macOS; Windows and Linux run on the CPU. Microsoft has published no Intel macOS build since 1.23.x
       # (no onnxruntime-osx-x86_64 archive, no osx-x64 in the NuGet package), so darwin-x64 runs no model.
+      # Fork: v1.31.0's archives are gone from GitHub (404 on every platform), so no row downloads it or runs BEN2.
       - name: Download ONNX Runtime
-        if: matrix.platform != 'darwin-x64'
+        if: false
         shell: bash
         run: |
           v=1.31.0
@@ -218,7 +247,7 @@ jobs:
       # on the Fred Ott frame in the repository. It runs on ONNX Runtime's CPU here (CoreML on macOS). Not a
       # download users get from CI: the weights are fetched for this test only, and are not cached or kept.
       - name: Test BEN2 on a real frame (macOS, Linux)
-        if: runner.os != 'Windows' && matrix.platform != 'darwin-x64'
+        if: false
         env:
           PKG_CONFIG_PATH: ${{ runner.temp }}/ffmpeg/lib/pkgconfig
         run: |
@@ -228,7 +257,7 @@ jobs:
 
       # PowerShell, like the other Windows cargo steps: in Git Bash, /usr/bin/link shadows MSVC's link.exe.
       - name: Test BEN2 on a real frame (Windows)
-        if: runner.os == 'Windows'
+        if: false
         env:
           FFMPEG_DIR: ${{ runner.temp }}\ffmpeg
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
