@@ -5,7 +5,8 @@ name: native
 on:
   # main only: a branch is built through its pull request, so a push to one does not build twice.
   push:
-    branches: [main]
+    # ma/main: fork only (methodacting/kinetograph), our patches over upstream main; drop before upstreaming.
+    branches: [main, ma/main]
   pull_request:
   workflow_dispatch:
 
@@ -23,6 +24,11 @@ jobs:
   build:
     name: build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
+    # macos-15-intel's virtual GPU reports no MTLGPUFamily, and Skia Graphite's Metal start aborts on that (a fatal
+    # assert, so the CPU fallback never runs). The Intel row draws with Skia's CPU backend; a real Intel Mac's GPU is
+    # not exercised here.
+    env:
+      KINETOGRAPH_SKIA_CPU: ${{ matrix.platform == 'darwin-x64' && '1' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +36,10 @@ jobs:
           - os: macos-15
             platform: darwin-arm64
             target: aarch64-apple-darwin
+          # GitHub's Intel macOS image, built natively rather than cross-compiled so that its tests run.
+          - os: macos-15-intel
+            platform: darwin-x64
+            target: x86_64-apple-darwin
           - os: ubuntu-22.04
             platform: linux-x64-gnu
             target: x86_64-unknown-linux-gnu
@@ -64,6 +74,11 @@ jobs:
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install pkgconf cmake
+
+      # x86 assembly in ffmpeg, openh264, libvpx and x264.
+      - name: Install nasm (Intel macOS)
+        if: matrix.platform == 'darwin-x64'
+        run: brew install nasm
 
       - name: Install build dependencies (Windows)
         if: runner.os == 'Windows'
@@ -290,8 +305,9 @@ jobs:
 
       # ONNX Runtime for the BEN2 step: Microsoft's NuGet package Microsoft.ML.OnnxRuntime, the version and SHA-512 that
       # packages/video-matting/src/registry.ts pins (users get it from the same package on the first use of matting). Its
-      # CoreML is on macOS; Windows and Linux run on the CPU.
+      # CoreML is on macOS; Windows and Linux run on the CPU. The package has no osx-x64 runtime, so darwin-x64 runs no model.
       - name: Download ONNX Runtime
+        if: matrix.platform != 'darwin-x64'
         shell: bash
         run: |
           v=1.31.0
@@ -326,7 +342,7 @@ jobs:
       # on the Fred Ott frame in the repository. It runs on ONNX Runtime's CPU here (CoreML on macOS). Not a
       # download users get from CI: the weights are fetched for this test only, and are not cached or kept.
       - name: Test BEN2 on a real frame (macOS, Linux)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.platform != 'darwin-x64'
         env:
           PKG_CONFIG_PATH: ${{ runner.temp }}/ffmpeg/lib/pkgconfig
         run: |
@@ -377,7 +393,13 @@ jobs:
   smoke:
     name: smoke (${{ matrix.platform }})
     needs: build
+    # Fork only: each platform smokes its own artifact even when another platform's build failed. A row whose build
+    # failed fails at its download.
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
+    # Skia on the CPU on Intel macOS, as in the build job.
+    env:
+      KINETOGRAPH_SKIA_CPU: ${{ matrix.platform == 'darwin-x64' && '1' || '' }}
     # Windows runners have no GPU and no Vulkan driver: wgpu uses Direct3D 12 (WARP) and Skia draws on the CPU.
     continue-on-error: ${{ matrix.allow_fail }}
     strategy:
@@ -386,6 +408,9 @@ jobs:
         include:
           - os: macos-15
             platform: darwin-arm64
+            allow_fail: false
+          - os: macos-15-intel
+            platform: darwin-x64
             allow_fail: false
           - os: ubuntu-22.04
             platform: linux-x64-gnu

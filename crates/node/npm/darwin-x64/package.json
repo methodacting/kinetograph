@@ -1,0 +1,52 @@
+{
+  "name": "@kinetographdev/native-darwin-x64",
+  "version": "0.4.0-rc.1",
+  "cpu": [
+    "x64"
+  ],
+  "main": "kinetograph.darwin-x64.node",
+  "files": [
+    "kinetograph.darwin-x64.node",
+    "COPYING.LGPLv2.1",
+    "OPENH264-LICENSE",
+    "THIRD-PARTY-NOTICES.md",
+    "OFL-NOTO.txt",
+    "bin/ffmpeg",
+    "bin/SOURCES.txt",
+    "FFMPEG-LICENSE.md",
+    "COPYING.GPLv2",
+    "CERES-LICENSE",
+    "EIGEN-COPYING.BSD",
+    "EIGEN-COPYING.MPL2",
+    "LIBMV-LICENSE",
+    "NOTICE"
+  ],
+  "description": "Node-API addon exposing the Kinetograph renderer",
+  "keywords": [
+    "video",
+    "remotion",
+    "motion-graphics",
+    "renderer",
+    "gpu",
+    "headless"
+  ],
+  "homepage": "https://github.com/0xS4N4TG/kinetograph#readme",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xS4N4TG/kinetograph.git",
+    "directory": "crates/node"
+  },
+  "bugs": {
+    "url": "https://github.com/0xS4N4TG/kinetograph/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "darwin"
+  ]
+}

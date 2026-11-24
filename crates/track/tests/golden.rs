@@ -14,6 +14,7 @@ use kinetograph_track::{
 fn platform() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x64",
         ("linux", "x86_64") => "linux-x64-gnu",
         ("windows", "x86_64") => "win32-x64-msvc",
         _ => "other",

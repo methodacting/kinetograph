@@ -1,9 +1,10 @@
 // Fetches the ANGLE libraries for one platform package: our own release (default) or Chrome for Testing (no dependencies).
-//   node scripts/fetch-angle.mjs <darwin-arm64|linux-x64-gnu|win32-x64-msvc> [--swiftshader] [--source chrome|release] [--cache <dir>] [--out <dir>]
+//   node scripts/fetch-angle.mjs <darwin-arm64|darwin-x64|linux-x64-gnu|win32-x64-msvc> [--swiftshader] [--source chrome|release] [--cache <dir>] [--out <dir>]
 //
 // SOURCE: where the libraries come from. `release` (the default, DEFAULT_SOURCE below) is our own ANGLE build, the GitHub
 // release in RELEASE (repository 0xS4N4TG/kinetograph-angle, built by that repository's workflow). `chrome` is Chrome for
-// Testing, below. Pass `--source` for one run. The release holds the two libraries, SwiftShader (the software Vulkan driver
+// Testing, below. Pass `--source` for one run. A platform the release has no build for (darwin-x64, Intel macOS) takes
+// Chrome for Testing whatever the default. The release holds the two libraries, SwiftShader (the software Vulkan driver
 // and its ICD file, plus the Vulkan loader on Linux and Windows; macOS links the loader into ANGLE), ANGLE's LICENSE,
 // THIRD-PARTY-NOTICES.txt (every third-party component built into the files, with its licence) and a SOURCE.txt.
 //
@@ -90,6 +91,19 @@ export const PLATFORMS = {
     ],
     software: [
       ['libvk_swiftshader.dylib', '02958ed48578bf3b7d68f6cbd8b3fb9514f179bdfe15717d663ed12f1a5f81c4'],
+      ['vk_swiftshader_icd.json', 'd717d915e31e7c27948b80b36ab34e2d897888114c5c7d0af835f93eb53e58f5'],
+    ],
+  },
+  // Intel macOS (fork): our release has no build for it.
+  'darwin-x64': {
+    cft: 'mac-x64',
+    archive: '2421e227509a56b85c4c0adc0662b31fb21e51d04f26588964d139ce40b32675',
+    libs: [
+      ['libEGL.dylib', '9889d6a82be8e9543ba1898ebb3a2974f92e515e8e5f612491b323c2eaece0cc'],
+      ['libGLESv2.dylib', '6f18e7a00342a4d9e9e1bab7d7fd8e8013943bbfc3f059f4d58dc7215eeb0d93'],
+    ],
+    software: [
+      ['libvk_swiftshader.dylib', '57b5359891fbfdeea117c927ca8721626fac0df93eb7b7a8b528a925153a81af'],
       ['vk_swiftshader_icd.json', 'd717d915e31e7c27948b80b36ab34e2d897888114c5c7d0af835f93eb53e58f5'],
     ],
   },
@@ -218,11 +232,11 @@ export async function fetchAngle(platform, { swiftshader = false, source = DEFAU
   const spec = PLATFORMS[platform];
   if (!spec) throw new Error(`unknown platform ${JSON.stringify(platform)}; one of ${Object.keys(PLATFORMS).join(', ')}`);
   if (source !== 'chrome' && source !== 'release') throw new Error(`unknown source ${JSON.stringify(source)}; chrome or release`);
-  const own = source === 'release';
+  const rel = RELEASE.platforms[platform];
+  const own = source === 'release' && rel !== undefined;
   const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
   cacheDir ??= path.join(os.homedir(), '.cache', 'kinetograph', 'angle');
   outDir ??= path.join(here, '..', 'crates', 'node', 'npm', platform, 'angle');
-  const rel = RELEASE.platforms[platform];
   const wanted = own ? [...rel.libs, ...(swiftshader ? rel.software : [])] : [...spec.libs, ...(swiftshader ? spec.software : [])];
   const top = `chrome-headless-shell-${spec.cft}`;
   const releaseUrl = own ? `https://github.com/${RELEASE.repo}/releases/download/${RELEASE.tag}/${rel.asset}` : '';
@@ -234,7 +248,7 @@ export async function fetchAngle(platform, { swiftshader = false, source = DEFAU
     .join('\n');
 
   // Files this script manages and does not want now (another source, SwiftShader switched off) are removed, so the folder is exact.
-  const managed = [...spec.libs, ...spec.software, ...rel.software].map(([n]) => n).concat(LICENSES.map(([n]) => n), CREDITS, NOTICES, 'SOURCE.txt');
+  const managed = [...spec.libs, ...spec.software, ...(rel?.software ?? [])].map(([n]) => n).concat(LICENSES.map(([n]) => n), CREDITS, NOTICES, 'SOURCE.txt');
   const keep = new Set(
     own
       ? [...wanted.map(([n]) => n), 'ANGLE-LICENSE', NOTICES, 'SOURCE.txt']
@@ -316,7 +330,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   const swiftshader = si >= 0 && !!args.splice(si, 1);
   const [platform] = args;
   if (!platform || args.length !== 1) {
-    console.error('usage: node scripts/fetch-angle.mjs <darwin-arm64|linux-x64-gnu|win32-x64-msvc> [--swiftshader] [--source chrome|release] [--cache <dir>] [--out <dir>]');
+    console.error('usage: node scripts/fetch-angle.mjs <darwin-arm64|darwin-x64|linux-x64-gnu|win32-x64-msvc> [--swiftshader] [--source chrome|release] [--cache <dir>] [--out <dir>]');
     process.exit(2);
   }
   fetchAngle(platform, { swiftshader, source, cacheDir, outDir }).catch((e) => {

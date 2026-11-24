@@ -132,7 +132,7 @@ export async function head(file: string): Promise<Buffer> {
 export function findFfmpeg(): string {
   const env = process.env.KINETOGRAPH_FFMPEG;
   if (env) return env;
-  const platform = ({ 'darwin-arm64': 'darwin-arm64', 'linux-x64': 'linux-x64-gnu', 'win32-x64': 'win32-x64-msvc' } as Record<string, string>)[`${process.platform}-${process.arch}`];
+  const platform = ({ 'darwin-arm64': 'darwin-arm64', 'darwin-x64': 'darwin-x64', 'linux-x64': 'linux-x64-gnu', 'win32-x64': 'win32-x64-msvc' } as Record<string, string>)[`${process.platform}-${process.arch}`];
   if (platform) {
     try {
       const require = createRequire(import.meta.url);

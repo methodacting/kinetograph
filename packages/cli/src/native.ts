@@ -10,6 +10,7 @@ export type Native = typeof NativeApi;
 /** The platform packages that carry the addon and `bin/ffmpeg`, by `process.platform-process.arch`. */
 const PLATFORM_PACKAGES: Record<string, string> = {
   'darwin-arm64': 'darwin-arm64',
+  'darwin-x64': 'darwin-x64',
   'linux-x64': 'linux-x64-gnu',
   'win32-x64': 'win32-x64-msvc',
 };
