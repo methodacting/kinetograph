@@ -1,5 +1,34 @@
-import { describe, expect, it } from 'vitest';
-import { createWebGLContext, glslShader, GL, GL2, layerPicture, VideoFramePicture, WebGLUnsupportedError, type WebGLContext } from '../src/index.js';
+import { createHash } from 'node:crypto';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { createWebGLContext, glslShader, GL, GL2, layerPicture, setBlobSink, VideoFramePicture, WebGLUnsupportedError, type BlobRef, type BlobSink, type GlslBuffer, type GlslData, type WebGLContext } from '../src/index.js';
+
+/** The ref of these bytes: their SHA-256. */
+const ref = (bytes: ArrayLike<number>): BlobRef => `sha256:${createHash('sha256').update(Uint8Array.from(bytes)).digest('hex')}`;
+
+/** What the recordings put, by ref, and how many times each content was put. */
+const blobs = new Map<string, Uint8Array>();
+const puts = new Map<string, number>();
+const sink: BlobSink = {
+  dir: 'blobs',
+  put(bytes) {
+    const blob = ref(bytes);
+    blobs.set(blob, bytes.slice());
+    puts.set(blob, (puts.get(blob) ?? 0) + 1);
+    return blob;
+  },
+};
+beforeEach(() => {
+  blobs.clear();
+  puts.clear();
+  setBlobSink(sink);
+});
+
+/** The bytes of a payload a recording names. */
+function bytesOf(payload: GlslData | GlslBuffer | undefined): Buffer {
+  const bytes = payload === undefined ? undefined : blobs.get(payload.blob);
+  if (bytes === undefined) throw new Error(`no blob for ${JSON.stringify(payload)}`);
+  return Buffer.from(bytes);
+}
 
 const VERTEX = 'attribute vec2 p; varying vec2 v; void main() { v = p; gl_Position = vec4(p, 0.0, 1.0); }';
 const FRAGMENT = 'precision mediump float; varying vec2 v; uniform float t; uniform vec2 r[2]; uniform sampler2D tex; void main() { gl_FragColor = texture2D(tex, v) * t; }';
@@ -45,7 +74,8 @@ describe('the recording WebGL context', () => {
     expect(draw.attributes.p).toMatchObject({ size: 2, type: 'f32', stride: 0, offset: 0 });
     expect(Object.keys(content.programs)).toHaveLength(1);
     expect(content.programs[draw.program]!.attributes).toEqual({ p: 0 });
-    expect(Buffer.from(content.buffers[draw.attributes.p!.buffer]!, 'base64')).toHaveLength(24);
+    expect(bytesOf(content.buffers[draw.attributes.p!.buffer])).toHaveLength(24);
+    expect(content.blobs).toBe('blobs');
   });
 
   it('keeps one program and one buffer for draws that share them, and drops all at a clear', () => {
@@ -55,6 +85,24 @@ describe('the recording WebGL context', () => {
     expect(Object.keys(gl.content().buffers)).toHaveLength(1);
     gl.clear(GL.COLOR_BUFFER_BIT);
     expect(gl.content().ops).toHaveLength(1);
+  });
+
+  it('puts each content once, however many frames sample it', () => {
+    const { gl, program } = setup();
+    const pixels = new Uint8Array([9, 8, 7, 255]);
+    gl.bindTexture(GL.TEXTURE_2D, gl.createTexture());
+    gl.texImage2D(GL.TEXTURE_2D, 0, GL.RGBA, 1, 1, 0, GL.RGBA, GL.UNSIGNED_BYTE, pixels);
+    gl.uniform1i(gl.getUniformLocation(program, 'tex'), 0);
+    for (let frame = 0; frame < 2; frame += 1) {
+      gl.resetState();
+      gl.drawArrays(GL.TRIANGLES, 0, 3);
+      const content = gl.content();
+      const draw = content.ops[0]!;
+      if (draw.op !== 'draw') throw new Error('not a draw');
+      expect(content.textures[draw.units['0']!.texture]!.data).toEqual({ blob: ref(pixels), encoding: 'rgba8' });
+    }
+    expect(puts.get(ref(pixels))).toBe(1);
+    expect(puts.get(ref(new Uint8Array(new Float32Array([-1, -1, 1, -1, -1, 1]).buffer)))).toBe(1);
   });
 
   it('starts a fresh drawing buffer after resetState, so a frame that draws nothing draws nothing', () => {
@@ -173,7 +221,7 @@ describe('the recording WebGL context', () => {
     const stored = content.textures[unit.texture]!;
     expect(stored).toMatchObject({ width: 2, height: 1, flipY: true });
     // RGB became RGBA with opaque alpha.
-    expect([...Buffer.from(stored.pixels!, 'base64')]).toEqual([255, 0, 0, 255, 0, 255, 0, 255]);
+    expect([...bytesOf(stored.data)]).toEqual([255, 0, 0, 255, 0, 255, 0, 255]);
   });
 
   it('records a picture of a layer as a texture that names the layer, until pixels replace it', () => {
@@ -936,7 +984,7 @@ describe('the recording WebGL context', () => {
       expect(stored.src).toBe('base.png');
       expect(stored.patches).toEqual([
         { x: 2, y: 2, width: 4, height: 4, layer: 'child' },
-        { x: 0, y: 0, width: 1, height: 1, pixels: Buffer.from([1, 2, 3, 4]).toString('base64') },
+        { x: 0, y: 0, width: 1, height: 1, data: { blob: ref([1, 2, 3, 4]), encoding: 'rgba8' } },
       ]);
 
       // Over the whole texture, as three.js fills a texStorage2D with a canvas, it is the picture: nothing of what the texture held is kept.
@@ -947,7 +995,7 @@ describe('the recording WebGL context', () => {
       const picture = new Uint8Array(32).fill(7);
       gl.texSubImage2D(GL.TEXTURE_2D, 0, 0, 0, 4, 2, GL.RGBA, GL.UNSIGNED_BYTE, picture);
       gl.drawArrays(GL.TRIANGLES, 0, 3);
-      expect(gl.content().textures[draws(gl)[1]!.units['0']!.texture]).toEqual({ pixels: Buffer.from(picture).toString('base64'), width: 4, height: 2, flipY: true });
+      expect(gl.content().textures[draws(gl)[1]!.units['0']!.texture]).toEqual({ data: { blob: ref(picture), encoding: 'rgba8' }, width: 4, height: 2, flipY: true });
 
       // Into a texture a framebuffer drew in: an op after the draws.
       const target = gl.createTexture();
@@ -1033,8 +1081,8 @@ describe('the recording WebGL context', () => {
       expect(draw.units['0']!.wrapR).toBeUndefined();
       const volume = content.textures[draw.units['1']!.texture]!;
       expect(volume).toMatchObject({ width: 2, height: 2, depth: 2 });
-      expect(Buffer.from(volume.floats!, 'base64')).toHaveLength(32 * 4);
-      expect(volume.pixels).toBeUndefined();
+      expect(bytesOf(volume.data)).toHaveLength(32 * 4);
+      expect(volume.data!.encoding).toBe('rgba-f32-le');
       expect(content.textures[draw.units['0']!.texture]!.depth).toBeUndefined();
     });
 
@@ -1052,7 +1100,7 @@ describe('the recording WebGL context', () => {
       const draw = content.ops[0]!;
       if (draw.op !== 'draw') throw new Error('not a draw');
       const volume = content.textures[draw.units['0']!.texture]!;
-      const bytes = Buffer.from(volume.pixels!, 'base64');
+      const bytes = bytesOf(volume.data);
       expect([...bytes.subarray(12, 16)]).toEqual([1, 2, 3, 4]);
       expect(bytes.subarray(0, 12).every((b) => b === 0)).toBe(true);
     });
@@ -1149,7 +1197,7 @@ describe('the recording WebGL context', () => {
       const texture = content.textures[draw.units['0']!.texture]!;
       expect(texture).toMatchObject({ width: 3, height: 1, float32: true });
       expect(texture.depth).toBeUndefined();
-      expect([...new Float32Array(new Uint8Array(Buffer.from(texture.floats!, 'base64')).buffer)]).toEqual([0.25, 0, 0, 1, 2, 0, 0, 1, -1, 0, 0, 1]);
+      expect([...new Float32Array(new Uint8Array(bytesOf(texture.data)).buffer)]).toEqual([0.25, 0, 0, 1, 2, 0, 0, 1, -1, 0, 0, 1]);
     });
 
     it('keeps 16-bit formats as half floats, reads half-float data, and flips the rows', () => {
@@ -1164,7 +1212,7 @@ describe('the recording WebGL context', () => {
       if (draw.op !== 'draw') throw new Error('not a draw');
       const texture = content.textures[draw.units['0']!.texture]!;
       expect(texture.float32).toBeUndefined();
-      expect([...new Float32Array(new Uint8Array(Buffer.from(texture.floats!, 'base64')).buffer)]).toEqual([2, 1, 0, 1, 1, 2, 0, 1]);
+      expect([...new Float32Array(new Uint8Array(bytesOf(texture.data)).buffer)]).toEqual([2, 1, 0, 1, 1, 2, 0, 1]);
     });
 
     it('flips and premultiplies the rows of a texSubImage2D of floats, as of a texImage2D', () => {
@@ -1179,7 +1227,7 @@ describe('the recording WebGL context', () => {
       const draw = content.ops[0]!;
       if (draw.op !== 'draw') throw new Error('not a draw');
       const texture = content.textures[draw.units['0']!.texture]!;
-      expect([...new Float32Array(new Uint8Array(Buffer.from(texture.floats!, 'base64')).buffer)]).toEqual([
+      expect([...new Float32Array(new Uint8Array(bytesOf(texture.data)).buffer)]).toEqual([
         0, 0, 0, 0, 0, 0, 0, 0,
         4, 5, 6, 1, 0, 0, 0, 0,
         0.5, 1, 1.5, 0.5, 0, 0, 0, 0,
@@ -1252,7 +1300,7 @@ describe('the recording WebGL context', () => {
       expect(texture.cube).toBe(true);
       expect(texture.width).toBe(2);
       expect(texture.faces).toHaveLength(6);
-      expect(Buffer.from(texture.faces![3]!.pixels!, 'base64')[0]).toBe(40);
+      expect(bytesOf(texture.faces![3]!.data)[0]).toBe(40);
     });
 
     it('is incomplete, and records no faces, until all six are uploaded', () => {
@@ -1549,7 +1597,7 @@ describe('the recording WebGL context', () => {
       if (draw.op !== 'draw') throw new Error('not a draw');
       const texture = gl.content().textures[draw.units['0']!.texture]!;
       expect(texture).toMatchObject({ cube: true, width: 2, srgb: true, mipmaps: true });
-      expect(Buffer.from(texture.faces![5]!.pixels!, 'base64')[0]).toBe(6);
+      expect(bytesOf(texture.faces![5]!.data)[0]).toBe(6);
       expect(() => gl.texSubImage2D(GL.TEXTURE_CUBE_MAP_POSITIVE_X, 0, 1, 0, 1, 1, GL.RGBA, GL.UNSIGNED_BYTE, new Uint8Array(4))).toThrow(WebGLUnsupportedError);
     });
 
@@ -1631,7 +1679,7 @@ describe('the recording WebGL context', () => {
       const texture = content.textures[draw.units['0']!.texture]!;
       expect(texture).toMatchObject({ width: 2, height: 1, depth: 3, array: true });
       expect(draw.units['0']!.wrapR).toBeUndefined();
-      const pixels = Buffer.from(texture.pixels!, 'base64');
+      const pixels = bytesOf(texture.data);
       expect(Array.from(pixels.subarray(20, 24))).toEqual([9, 9, 9, 9]);
       expect(Array.from(pixels.subarray(16, 20))).toEqual([1, 1, 1, 1]);
     });
@@ -1647,7 +1695,7 @@ describe('the recording WebGL context', () => {
       const { content, draw } = drawn(gl);
       const texture = content.textures[draw.units['0']!.texture]!;
       expect(texture).toMatchObject({ width: 2, height: 2, depth: 4, array: true, float32: true });
-      const bytes = Buffer.from(texture.floats!, 'base64');
+      const bytes = bytesOf(texture.data);
       const floats = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
       expect(floats).toHaveLength(64);
       expect(floats[47]).toBe(0);

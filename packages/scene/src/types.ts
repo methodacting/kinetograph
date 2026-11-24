@@ -789,11 +789,32 @@ export interface GlslProgram {
   attributes?: Record<string, number>;
 }
 
+/** The SHA-256 of a blob's bytes: the file `<blobs>/<hex>` of the recording's blob directory. */
+export type BlobRef = `sha256:${string}`;
+
+/** How a payload's bytes are laid out: RGBA8 (straight alpha), or four little-endian `f32`s a texel. */
+export type GlslEncoding = 'rgba8' | 'rgba-f32-le';
+
+/** A payload: its bytes, a blob, and how they are laid out. A hash names the bytes; the texture says what they are. */
+export interface GlslData {
+  blob: BlobRef;
+  encoding: GlslEncoding;
+}
+
+/** A buffer's bytes (`bufferData`), a blob. */
+export interface GlslBuffer {
+  blob: BlobRef;
+}
+
 export interface GlslTexture {
   /** A picture file relative to the scene, or a `data:` URL. */
   src?: string;
-  /** Base64 RGBA8, straight alpha. */
-  pixels?: string;
+  /**
+   * The texels: `rgba8` (`width * height * 4` bytes, times `depth` for a 3D one) or, for a float texture (`R32F`,
+   * `RGBA16F` and the like, 2D or 3D), `rgba-f32-le` (four floats a texel, x fastest, then y, then z; what the format
+   * lacks is 0, and alpha 1), kept as half floats, or as 32-bit ones with `float32`.
+   */
+  data?: GlslData;
   /** The `id` of a child of the shader group the recording belongs to: the texture is that layer, drawn. */
   layer?: string;
   width?: number;
@@ -811,23 +832,18 @@ export interface GlslTexture {
   format?: 'depth' | 'stencil' | 'depthStencil';
   /** The mip levels of a colour target (default 1): an op's `level` draws into one. */
   levels?: number;
-  /** An `SRGB8_ALPHA8` texture: its bytes are sRGB, which a shader reads as linear (`pixels` or `src`, not a layer). */
+  /** An `SRGB8_ALPHA8` texture: its bytes are sRGB, which a shader reads as linear (`data` or `src`, not a layer). */
   srgb?: boolean;
   /** A colour target of a float format (default: RGBA8); a 32-bit one is sampled only `NEAREST`, and not blended into. */
   colorFormat?: 'R16F' | 'RG16F' | 'RGBA16F' | 'R32F' | 'RG32F' | 'RGBA32F' | 'SRGB8_ALPHA8' | 'R8' | 'RG8';
   /** A depth texture of a WebGL 1 context: sampled as (d, d, d, 1), where WebGL 2 samples (d, 0, 0, 1). */
   luminance?: boolean;
-  /** `texSubImage2D` of pictures over parts of the texture, in order, after `src`, `pixels` or `layer`. */
+  /** `texSubImage2D` of pictures over parts of the texture, in order, after `src`, `data` or `layer`. */
   patches?: GlslPatch[];
-  /** A 3D texture (`texImage3D`) of `width` by `height` by this many layers, its texels `pixels` (RGBA8) or `floats`; left out for a 2D texture. */
+  /** A 3D texture (`texImage3D`) of `width` by `height` by this many layers, its texels `data`; left out for a 2D texture. */
   depth?: number;
   /** With `depth`: a `TEXTURE_2D_ARRAY` (read by a `sampler2DArray`), not a 3D texture; `depth` is its layer count. */
   array?: boolean;
-  /**
-   * A float texture (`R32F`, `RGBA16F` and the like), 2D or 3D: base64 little-endian `f32`s, four for each texel (x
-   * fastest, then y, then z; what the format lacks is 0, and alpha 1). Kept as half floats, or as 32-bit ones with `float32`.
-   */
-  floats?: string;
   /** The floats are `R32F`, `RG32F`, `RGB32F` or `RGBA32F`: kept in full, and sampled only `NEAREST` (a browser has no linear filter for them). */
   float32?: boolean;
   /**
@@ -840,10 +856,10 @@ export interface GlslTexture {
   targets?: string[];
 }
 
-/** One face of a cube map: a picture file, a `data:` URL or base64 RGBA8 (straight alpha, `width * width * 4` bytes). */
+/** One face of a cube map: a picture file, a `data:` URL or `rgba8` data (`width * width * 4` bytes). */
 export interface GlslFace {
   src?: string;
-  pixels?: string;
+  data?: GlslData;
   flipY?: boolean;
   premultiply?: boolean;
 }
@@ -854,9 +870,9 @@ export interface GlslPatch {
   y: number;
   width: number;
   height: number;
-  /** One of: a picture file, base64 RGBA8 (straight alpha), or a child of the shader group. */
+  /** One of: a picture file, `rgba8` data, or a child of the shader group. */
   src?: string;
-  pixels?: string;
+  data?: GlslData;
   layer?: string;
   flipY?: boolean;
   premultiply?: boolean;
@@ -1015,8 +1031,8 @@ export interface GlslUpload {
   y: number;
   width: number;
   height: number;
-  /** One of: base64 RGBA8 (straight alpha), a picture file, or a child of the shader group. */
-  pixels?: string;
+  /** One of: `rgba8` data, a picture file, or a child of the shader group. */
+  data?: GlslData;
   src?: string;
   layer?: string;
   flipY?: boolean;
@@ -1044,9 +1060,13 @@ export interface GlslContent {
   stencil?: boolean;
   /** The context's `antialias` attribute: the drawing buffer is multisampled (4 samples). */
   antialias?: boolean;
+  /**
+   * The directory the recording's blobs are in, as a path or relative to the scene's: each payload is the file named
+   * by its hash, written once.
+   */
+  blobs?: string;
   programs: Record<string, GlslProgram>;
-  /** Base64 bytes. */
-  buffers: Record<string, string>;
+  buffers: Record<string, GlslBuffer>;
   textures: Record<string, GlslTexture>;
   ops: GlslOp[];
   /** What a WebGPU context did (the other fields are empty then). */

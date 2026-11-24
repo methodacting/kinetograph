@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { ArtifactRecord, CompositionInfo, FrameRenderer } from '@kinetographdev/core';
@@ -24,7 +25,7 @@ interface ProjectModule {
   setMediaParserAddon(addon: import('@kinetographdev/core/media-parser').MediaParserAddon | null): void;
   setDomAddon(addon: object | null): void;
   setFallbackFont(path: string | null): void;
-  setDomEnvironment(environment: { baseDir: string; publicDir?: string }): void;
+  setDomEnvironment(environment: { baseDir: string; publicDir?: string; blobs?: string }): void;
   /** Problems with the project's stylesheets (Tailwind that could not be built, a remote font). */
   stylesheetNotes(): string[];
   /** The files `<Artifact>`s asked the render to write (packages/cli/skills/kinetograph-markup/references/AUTHORING.md §9). */
@@ -153,8 +154,18 @@ export function projectRootOf(entry: string): string {
   }
 }
 
+/**
+ * A render's blob directory (packages/compat/src/blobs.ts): where its WebGL recordings put texture and buffer data, made
+ * when the render opens. `remove` deletes it, which the opener does when the render ends or fails to open.
+ */
+function blobDirectory(): { dir: string; remove(): void } {
+  const dir = mkdtempSync(join(tmpdir(), 'kinetograph-blobs-'));
+  return { dir, remove: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
 async function loadProject(
   entry: string,
+  blobs: string,
   bundleFile?: string,
   unsupported?: UnsupportedImport[],
   prefetch: { offline?: boolean; progress?: (message: string) => void } | null = null,
@@ -191,7 +202,7 @@ async function loadProject(
   mod.setFallbackFont(LABEL_FONT_PATH);
   // The DOM engine: islands are styled, laid out and painted by the addon, relative paths resolve from the entry.
   mod.setDomAddon(native());
-  mod.setDomEnvironment({ baseDir: dirname(entry), publicDir });
+  mod.setDomEnvironment({ baseDir: dirname(entry), publicDir, blobs });
   // A relative `src` is read from where the scenes' assets are (the entry's directory), not the working directory.
   mod.setMediaProbe((path, baseDir) => native().probeMedia(path, baseDir ?? dirname(entry)));
   mod.setAudioDecoder((path, sampleRate) => native().decodeAudio(path, sampleRate, dirname(entry)));
@@ -208,20 +219,25 @@ async function loadProject(
 export async function listCompositions(entry: string, options: { bundleFile?: string; offline?: boolean; progress?: (message: string) => void } = {}): Promise<CompositionInfo[]> {
   const absolute = requireEntry(entry);
   if (isSceneFile(absolute)) return [sceneComposition(absolute, readFileSync(absolute, 'utf8'))];
-  const { mod } = await loadProject(absolute, options.bundleFile, undefined, options);
-  // A composition whose fps or length comes from `calculateMetadata` is listed with what that returns, as Remotion's does.
-  return Promise.all(
-    mod.getCompositions().map(async ({ metadataPending, ...info }) => {
-      if (!metadataPending) return info;
-      const renderer = mod.createFrameRenderer(info.id);
-      try {
-        const config = await renderer.ready();
-        return { ...info, width: config.width, height: config.height, fps: config.fps, durationInFrames: config.durationInFrames };
-      } finally {
-        renderer.dispose();
-      }
-    }),
-  );
+  const blobs = blobDirectory();
+  try {
+    const { mod } = await loadProject(absolute, blobs.dir, options.bundleFile, undefined, options);
+    // A composition whose fps or length comes from `calculateMetadata` is listed with what that returns, as Remotion's does.
+    return await Promise.all(
+      mod.getCompositions().map(async ({ metadataPending, ...info }) => {
+        if (!metadataPending) return info;
+        const renderer = mod.createFrameRenderer(info.id);
+        try {
+          const config = await renderer.ready();
+          return { ...info, width: config.width, height: config.height, fps: config.fps, durationInFrames: config.durationInFrames };
+        } finally {
+          renderer.dispose();
+        }
+      }),
+    );
+  } finally {
+    blobs.remove();
+  }
 }
 
 function sceneComposition(file: string, text: string): CompositionInfo {
@@ -264,9 +280,28 @@ export async function openSource(entry: string, options: OpenOptions = {}): Prom
     };
   }
 
+  const blobs = blobDirectory();
+  try {
+    return await openProject(entry, absolute, baseDir, notes, options, blobs);
+  } catch (error) {
+    // A failed open leaves no directory: there is no source for the caller to dispose.
+    blobs.remove();
+    throw error;
+  }
+}
+
+async function openProject(
+  entry: string,
+  absolute: string,
+  baseDir: string,
+  notes: ReturnType<typeof modelNotes>,
+  options: OpenOptions,
+  blobs: ReturnType<typeof blobDirectory>,
+): Promise<Source> {
   const inputProps = parseProps(options.props);
   const { mod, file: bundleFile } = await loadProject(
     absolute,
+    blobs.dir,
     options.bundleFile,
     options.unsupportedImports,
     options.prefetch === false ? null : options,
@@ -309,7 +344,13 @@ export async function openSource(entry: string, options: OpenOptions = {}): Prom
     notes: () => mod.stylesheetNotes(),
     artifacts: () => mod.getArtifacts(),
     clearArtifacts: () => mod.clearArtifacts(),
-    dispose: () => renderer.dispose(),
+    dispose: () => {
+      try {
+        renderer.dispose();
+      } finally {
+        blobs.remove();
+      }
+    },
   };
 }
 

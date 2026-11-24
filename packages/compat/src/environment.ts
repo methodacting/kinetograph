@@ -4,17 +4,26 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { setBlobSink } from '@kinetographdev/scene';
+import { fileBlobSink } from './blobs.js';
 
 export interface DomEnvironment {
   /** Relative paths in `src` and `url()` resolve against this, then `publicDir`. */
   baseDir: string;
   publicDir?: string;
+  /** The render's blob directory, where WebGL recordings put their texture and buffer data (`blobs.ts`). */
+  blobs?: string;
 }
 
 let environment: DomEnvironment | null = null;
 
 export function setDomEnvironment(next: DomEnvironment): void {
-  environment = { baseDir: next.baseDir, ...(next.publicDir !== undefined ? { publicDir: next.publicDir } : {}) };
+  environment = {
+    baseDir: next.baseDir,
+    ...(next.publicDir !== undefined ? { publicDir: next.publicDir } : {}),
+    ...(next.blobs !== undefined ? { blobs: next.blobs } : {}),
+  };
+  setBlobSink(next.blobs === undefined ? null : fileBlobSink(next.blobs));
 }
 
 /**
