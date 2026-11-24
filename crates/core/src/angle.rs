@@ -1193,7 +1193,7 @@ fn library_dir() -> Result<PathBuf, String> {
 
 /// The npm platform package this build is, as `scripts/fetch-angle.mjs` names it.
 const PLATFORM: &str = if cfg!(target_os = "macos") {
-    "darwin-arm64"
+    if cfg!(target_arch = "x86_64") { "darwin-x64" } else { "darwin-arm64" }
 } else if cfg!(windows) {
     "win32-x64-msvc"
 } else {
