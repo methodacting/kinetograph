@@ -21,8 +21,36 @@ env:
   FFMPEG_CACHE_VERSION: v4
 
 jobs:
+  # Fork only: the addon is built (and smoked) only when what goes into it changed: the Rust crates, Cargo's files, the
+  # ffmpeg and ANGLE scripts, or this workflow. A push of JavaScript only runs the js job, on the last addon built.
+  changes:
+    runs-on: ubuntu-22.04
+    outputs:
+      native: ${{ steps.diff.outputs.native }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        shell: bash
+        env:
+          BEFORE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # A manual run, a new branch or a base this clone does not have builds the addon.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || [ -z "$BEFORE" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo native=true >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          git diff --name-only "$BEFORE" "$GITHUB_SHA" | tee "$RUNNER_TEMP/changed"
+          if grep -qE '^(crates/|Cargo\.(toml|lock)$|rust-toolchain|\.cargo/|scripts/(fetch-angle\.mjs|build-ffmpeg(-gpl)?\.sh)$|\.github/workflows/native\.yml$)' "$RUNNER_TEMP/changed"; then
+            echo native=true >> "$GITHUB_OUTPUT"
+          else
+            echo native=false >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
     # macos-15-intel's virtual GPU reports no MTLGPUFamily, and Skia Graphite's Metal start aborts on that (a fatal
     # assert, so the CPU fallback never runs). The Intel row draws with Skia's CPU backend; a real Intel Mac's GPU is
@@ -388,10 +416,10 @@ jobs:
 
   smoke:
     name: smoke (${{ matrix.platform }})
-    needs: build
+    needs: [changes, build]
     # Fork only: each platform smokes its own artifact even when another platform's build failed. A row whose build
     # failed fails at its download.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.changes.outputs.native == 'true' }}
     runs-on: ${{ matrix.os }}
     # Skia on the CPU on Intel macOS, as in the build job.
     env:
@@ -450,18 +478,41 @@ jobs:
 
   js:
     name: typecheck and test (JS)
-    needs: build
+    needs: [changes, build]
+    # Fork only: also when the build was skipped (JavaScript only), on the last addon built.
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
+      # This run's addon when it built one, else the newest successful run on this branch that did.
+      - name: Find the addon's run
+        id: addon
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILT: ${{ needs.build.result }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if [ "$BUILT" = success ]; then echo "run=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"; exit 0; fi
+          for id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow native.yml --branch "$BRANCH" --status success --limit 30 --json databaseId --jq '.[].databaseId'); do
+            if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" --jq '.artifacts[] | select(.name == "bindings-linux-x64-gnu" and (.expired | not)) | .name' | grep -q .; then
+              echo "run=$id" >> "$GITHUB_OUTPUT"; echo "addon from run $id"; exit 0
+            fi
+          done
+          echo "no successful run on $BRANCH has a linux-x64-gnu addon: run this workflow by hand to build one"; exit 1
       - uses: actions/download-artifact@v8
         with:
           name: bindings-linux-x64-gnu
           path: crates/node
+          run-id: ${{ steps.addon.outputs.run }}
+          github-token: ${{ github.token }}
       - run: npm ci
       # In dependency order. Never `npm run build --workspaces`: it would also build the site and the addon.
       - name: Typecheck (tsc builds)
