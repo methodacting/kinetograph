@@ -14,15 +14,21 @@
 // A target regenerated only at a frame K before the one before the frame asked for is not seen.
 // Pure functions of the ops and what they name: nothing here reads the context.
 
-import type { GlslDraw, GlslOp, GlslProgram, GlslTexture } from './types.js';
+import type { GlslBuffer, GlslDraw, GlslOp, GlslProgram, GlslTexture } from './types.js';
 import { withoutComments } from './glsl-cpp.js';
 
 type Textures = Map<string, GlslTexture>;
 
+/** A buffer as the recording names it (`json`), and its bytes, which the recording may hold only as a blob. */
+export interface KeptBuffer {
+  json: GlslBuffer;
+  bytes: Uint8Array;
+}
+
 /** The programs, buffers and textures the ops name, by id (the fields of a recording that are not ops). */
 export interface Resources {
   programs: Map<string, GlslProgram>;
-  buffers: Map<string, string>;
+  buffers: Map<string, KeptBuffer>;
   textures: Map<string, GlslTexture>;
 }
 
@@ -103,9 +109,6 @@ function colourOutputs(op: GlslOp): { target: string; level: number }[] {
   return (op.outputs ?? []).flatMap((o) => (o === null ? [] : [{ target: o.target, level: o.level ?? 0 }]));
 }
 
-/** Decodes base64 to bytes. */
-const bytesOf = (base64: string): Uint8Array => new Uint8Array(Buffer.from(base64, 'base64'));
-
 /**
  * The attribute and the literal z in the one `gl_Position = vec4(a, ..., 1.0);` of a vertex shader, when that statement
  * is certain to run and reads the attribute the page declared: it stands at the top level of `main`, with no `return`
@@ -149,7 +152,7 @@ function clipPositions(draw: GlslDraw, res: Resources): [number, number][] | nul
   const attribute = draw.attributes[found.attribute];
   const data = attribute === undefined ? undefined : res.buffers.get(attribute.buffer);
   if (attribute === undefined || data === undefined || attribute.type !== 'f32' || attribute.size < 2 || (attribute.divisor ?? 0) !== 0) return null;
-  const bytes = bytesOf(data);
+  const bytes = data.bytes;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const stride = attribute.stride || attribute.size * 4;
   // With no literal, the attribute is a vec3 and its z is clipped where it leaves [-1, 1] (a vec2 one has z 0).
@@ -165,7 +168,7 @@ function clipPositions(draw: GlslDraw, res: Resources): [number, number][] | nul
     const index = res.buffers.get(draw.indices.buffer);
     const size = { u8: 1, u16: 2, u32: 4 }[draw.indices.type];
     if (index === undefined) return null;
-    const raw = bytesOf(index);
+    const raw = index.bytes;
     const indexView = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     for (let i = 0; i < draw.count; i++) {
       const place = draw.indices.offset + (draw.first + i) * size;

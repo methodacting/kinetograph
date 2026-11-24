@@ -9,8 +9,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use base64::Engine as _;
-
 use crate::angle::{self, Enum, Gl, Texels, gl};
 use crate::glsl::{
     self as rec, GlslAttribute, GlslContent, GlslDraw, GlslMode, GlslOp, GlslTexture, GlslType,
@@ -218,6 +216,8 @@ struct Replay<'a> {
     gl: &'a Gl,
     content: &'a GlslContent,
     base_dir: &'a Path,
+    /// The recording's blob directory (`GlslContent::blobs`), resolved against `base_dir`.
+    blobs: Option<std::path::PathBuf>,
     size: (u32, u32),
     layers: &'a Layers,
     ext: angle::Extensions,
@@ -347,6 +347,7 @@ fn run(
         gl: gl_,
         content,
         base_dir,
+        blobs: content.blob_dir(base_dir),
         size,
         layers,
         ext,
@@ -600,16 +601,17 @@ impl<'a> Replay<'a> {
         if let Some(b) = self.buffers.get(&(id, index)) {
             return Ok(*b);
         }
-        let b64 = self
+        let recorded = self
             .content
             .buffers
             .get(id)
             .ok_or_else(|| format!("no buffer {id}"))?;
-        // The id is the recorder's name, not a promise about the bytes (another scene may reuse it): the text is hashed.
+        // The id is the recorder's name, not a promise about the bytes (another scene may reuse it): the text, or the
+        // blob's hash, is hashed. A blob is read only when the context does not hold it yet.
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            b64.hash(&mut h);
+            recorded.hash(&mut h);
             format!("{id}|{:x}|{}", h.finish(), u8::from(index))
         };
         let ext = self.ext;
@@ -622,8 +624,8 @@ impl<'a> Replay<'a> {
             self.buffers.insert((id, index), name);
             return Ok(name);
         }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
+        let bytes = recorded
+            .bytes(self.blobs.as_deref())
             .map_err(|e| format!("buffer {id}: {e}"))?;
         let name = self.gl.gen_buffer();
         let target = if index { gl::ELEMENT_ARRAY_BUFFER } else { gl::ARRAY_BUFFER };
@@ -724,6 +726,7 @@ impl<'a> Replay<'a> {
         (t.width, t.height, t.depth, t.array, t.cube, t.float32).hash(&mut h);
         t.pixels.hash(&mut h);
         t.floats.hash(&mut h);
+        t.data.hash(&mut h);
         source(&mut h, t.src.as_deref());
         for patch in &t.patches {
             (
@@ -736,6 +739,7 @@ impl<'a> Replay<'a> {
             )
                 .hash(&mut h);
             patch.pixels.hash(&mut h);
+            patch.data.hash(&mut h);
             source(&mut h, patch.src.as_deref());
         }
         for call in &t.calls {
@@ -746,6 +750,7 @@ impl<'a> Replay<'a> {
             (face.flip_y, face.premultiply, face.float32).hash(&mut h);
             face.pixels.hash(&mut h);
             face.floats.hash(&mut h);
+            face.data.hash(&mut h);
             source(&mut h, face.src.as_deref());
         }
         format!(
@@ -835,7 +840,7 @@ impl<'a> Replay<'a> {
             if t.faces.is_empty() {
                 return Ok(whole(name, gl::TEXTURE_CUBE_MAP, None));
             }
-            if let Some((faces, side)) = rec::decode_cube_floats(t)? {
+            if let Some((faces, side)) = rec::decode_cube_floats(t, self.blobs.as_deref())? {
                 for (i, texels) in faces.iter().enumerate() {
                     let (internal, ty, bytes) = float_texels(texels);
                     gl_.tex_image_2d(
@@ -850,7 +855,7 @@ impl<'a> Replay<'a> {
                         }),
                     )?;
                 }
-            } else if let Some((faces, side)) = rec::decode_cube(t, self.base_dir)? {
+            } else if let Some((faces, side)) = rec::decode_cube(t, self.base_dir, self.blobs.as_deref())? {
                 for (i, rgba) in faces.iter().enumerate() {
                     gl_.tex_image_2d(
                         gl::TEXTURE_CUBE_MAP_POSITIVE_X + i as u32,
@@ -890,7 +895,7 @@ impl<'a> Replay<'a> {
                 );
                 return Ok(whole(name, target, f.format));
             }
-            let (internal, ty, bytes) = match &rec::decode_texels(t)? {
+            let (internal, ty, bytes) = match &rec::decode_texels(t, self.blobs.as_deref())? {
                 rec::Texels::Rgba8(b) => (gl::RGBA8, gl::UNSIGNED_BYTE, b.clone()),
                 other => {
                     let (i, ty, b) = float_texels(other);
@@ -914,8 +919,8 @@ impl<'a> Replay<'a> {
         }
         let name = gl_.gen_texture();
         gl_.bind_texture(gl::TEXTURE_2D, name);
-        if t.floats.is_some() {
-            let texels = rec::decode_texels(t)?;
+        if t.has_floats() {
+            let texels = rec::decode_texels(t, self.blobs.as_deref())?;
             let (internal, ty, bytes) = float_texels(&texels);
             gl_.tex_image_2d(
                 gl::TEXTURE_2D,
@@ -932,7 +937,7 @@ impl<'a> Replay<'a> {
             let (rgba, w, h) = match &t.layer {
                 Some(layer) => self.layer_picture(layer, t.flip_y, t.premultiply)?,
                 None => {
-                    let (mut rgba, w, h) = rec::decode_texture(t, self.base_dir)?;
+                    let (mut rgba, w, h) = rec::decode_texture(t, self.base_dir, self.blobs.as_deref())?;
                     rec::unpack(&mut rgba, w, t.flip_y, t.premultiply);
                     (rgba, w, h)
                 }
@@ -949,9 +954,10 @@ impl<'a> Replay<'a> {
                 }),
             )?;
             for p in &t.patches {
+                let pixels = rec::payload(p.pixels.as_deref(), p.data.as_ref(), rec::GlslEncoding::Rgba8, self.blobs.as_deref())?;
                 let (px, pw, ph) = self.picture(
                     p.layer.as_deref(),
-                    (p.src.as_deref(), p.pixels.as_deref()),
+                    (p.src.as_deref(), pixels),
                     (p.width, p.height),
                     (p.flip_y, p.premultiply),
                 )?;
@@ -987,7 +993,7 @@ impl<'a> Replay<'a> {
     fn picture(
         &self,
         layer: Option<&str>,
-        (src, pixels): (Option<&str>, Option<&str>),
+        (src, pixels): (Option<&str>, Option<rec::Bytes<'_>>),
         size: (u32, u32),
         (flip_y, premultiply): (bool, bool),
     ) -> R<(Vec<u8>, u32, u32)> {
@@ -1087,7 +1093,7 @@ impl<'a> Replay<'a> {
             Some(layer) => self.layer_picture(layer, c.flip_y, c.premultiply)?,
             None => rec::decode_picture(
                 c.src.as_deref(),
-                c.pixels.as_deref(),
+                c.pixels.as_deref().map(rec::Bytes::Base64),
                 (c.picture_width, c.picture_height),
                 self.base_dir,
             )?,
@@ -1322,9 +1328,10 @@ impl<'a> Replay<'a> {
     }
 
     fn upload(&mut self, u: &'a rec::GlslUpload) -> R<()> {
+        let pixels = rec::payload(u.pixels.as_deref(), u.data.as_ref(), rec::GlslEncoding::Rgba8, self.blobs.as_deref())?;
         let (px, w, h) = self.picture(
             u.layer.as_deref(),
-            (u.src.as_deref(), u.pixels.as_deref()),
+            (u.src.as_deref(), pixels),
             (u.width, u.height),
             (u.flip_y, u.premultiply),
         )?;

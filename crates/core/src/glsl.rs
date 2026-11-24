@@ -64,9 +64,13 @@ pub struct GlslContent {
     /// By id.
     #[serde(default)]
     pub programs: BTreeMap<String, GlslProgram>,
-    /// Base64 bytes, by id.
+    /// The directory of the recording's blobs (`GlslData`, `GlslBuffer::Blob`), as a path or relative to the scene's:
+    /// each is the file named by the SHA-256 of its bytes, written once by the host that recorded it.
     #[serde(default)]
-    pub buffers: BTreeMap<String, String>,
+    pub blobs: Option<String>,
+    /// By id.
+    #[serde(default)]
+    pub buffers: BTreeMap<String, GlslBuffer>,
     #[serde(default)]
     pub textures: BTreeMap<String, GlslTexture>,
     #[serde(default)]
@@ -74,6 +78,115 @@ pub struct GlslContent {
     /// What a WebGPU context drew (`crate::webgpu`); the fields above are empty then.
     #[serde(default)]
     pub webgpu: Option<crate::webgpu::WebGpuContent>,
+}
+
+/// How a blob's bytes are laid out: RGBA8 (straight alpha), as `pixels` holds them, or four little-endian `f32`s a texel,
+/// as `floats` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GlslEncoding {
+    Rgba8,
+    RgbaF32Le,
+}
+
+/// A payload a host's blob sink wrote, in place of the base64 `pixels` or `floats` beside it: `blob` is
+/// `sha256:<hex>`, the file `<hex>` of the recording's blob directory (`GlslContent::blobs`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlslData {
+    pub blob: String,
+    pub encoding: GlslEncoding,
+}
+
+/// A buffer's bytes (`bufferData`): base64, or a blob.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(untagged)]
+pub enum GlslBuffer {
+    Base64(String),
+    Blob { blob: String },
+}
+
+/// Where a payload's bytes are: base64 in the recording (an authored scene), or a blob file.
+pub enum Bytes<'a> {
+    Base64(&'a str),
+    Blob(std::path::PathBuf),
+}
+
+impl Bytes<'_> {
+    pub fn read(&self) -> std::result::Result<Vec<u8>, String> {
+        use base64::Engine as _;
+        match self {
+            Bytes::Base64(text) => base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(|e| format!("bytes that are not base64: {e}")),
+            Bytes::Blob(path) => {
+                std::fs::read(path).map_err(|e| format!("cannot read the blob {}: {e}", path.display()))
+            }
+        }
+    }
+}
+
+/// The file of the blob `blob` (`sha256:` and 64 lowercase hex digits) in the directory `blobs`; anything else, or no
+/// directory, is an error, so a recording names no file but a blob of its own.
+pub fn blob_path(blob: &str, blobs: Option<&std::path::Path>) -> std::result::Result<std::path::PathBuf, String> {
+    let hex = blob
+        .strip_prefix("sha256:")
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .ok_or_else(|| format!("{blob:?} is not a blob (sha256: and 64 hex digits)"))?;
+    let dir = blobs.ok_or_else(|| format!("the blob {blob} is named, and the recording has no blob directory"))?;
+    Ok(dir.join(hex))
+}
+
+/// The bytes of a payload given as base64 `text` or as the blob `data` of the `encoding` wanted (`data` of another
+/// encoding is not this payload); both is an error.
+pub fn payload<'a>(
+    text: Option<&'a str>,
+    data: Option<&GlslData>,
+    encoding: GlslEncoding,
+    blobs: Option<&std::path::Path>,
+) -> std::result::Result<Option<Bytes<'a>>, String> {
+    match (text, data.filter(|d| d.encoding == encoding)) {
+        (Some(_), Some(_)) => Err("a payload is given both as base64 and as a blob".into()),
+        (Some(text), None) => Ok(Some(Bytes::Base64(text))),
+        (None, Some(data)) => Ok(Some(Bytes::Blob(blob_path(&data.blob, blobs)?))),
+        (None, None) => Ok(None),
+    }
+}
+
+impl GlslBuffer {
+    /// The buffer's bytes (`blobs`: the recording's blob directory).
+    pub fn bytes(&self, blobs: Option<&std::path::Path>) -> std::result::Result<Vec<u8>, String> {
+        match self {
+            GlslBuffer::Base64(text) => Bytes::Base64(text).read(),
+            GlslBuffer::Blob { blob } => Bytes::Blob(blob_path(blob, blobs)?).read(),
+        }
+    }
+}
+
+impl GlslContent {
+    /// The recording's blob directory, relative to `base_dir` (the scene's) when it is not a full path.
+    pub fn blob_dir(&self, base_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        self.blobs.as_ref().map(|d| base_dir.join(d))
+    }
+}
+
+/// Whether `pixels` or `data` holds float texels (`floats`, or a blob of `rgba-f32-le`).
+fn holds_floats(floats: Option<&str>, data: Option<&GlslData>) -> bool {
+    floats.is_some() || data.is_some_and(|d| d.encoding == GlslEncoding::RgbaF32Le)
+}
+
+impl GlslTexture {
+    /// Its texels are floats (`floats`, or a blob of them).
+    pub fn has_floats(&self) -> bool {
+        holds_floats(self.floats.as_deref(), self.data.as_ref())
+    }
+}
+
+impl GlslFace {
+    /// Its texels are floats (`floats`, or a blob of them).
+    pub fn has_floats(&self) -> bool {
+        holds_floats(self.floats.as_deref(), self.data.as_ref())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -114,6 +227,8 @@ pub struct GlslTexture {
     pub video: Option<GlslVideo>,
     /// Base64 RGBA8, straight alpha, `width * height * 4` bytes.
     pub pixels: Option<String>,
+    /// Instead of `pixels` or `floats`: their bytes, a blob.
+    pub data: Option<GlslData>,
     /// The `id` of a child of the group this recording belongs to
     /// (`GroupLayer::glsl`): the picture is that child, drawn, as the
     /// drawing buffer's size and place would show it.
@@ -196,6 +311,8 @@ pub struct GlslTexture {
 pub struct GlslFace {
     pub src: Option<String>,
     pub pixels: Option<String>,
+    /// Instead of `pixels` or `floats`: their bytes, a blob.
+    pub data: Option<GlslData>,
     /// Instead of `src` or `pixels`: float texels (`RGBA16F`, `RGBA32F`, ...), as `GlslTexture::floats`. Every
     /// face of a cube map has them, or none does.
     pub floats: Option<String>,
@@ -273,9 +390,10 @@ pub struct GlslPatch {
     pub width: u32,
     pub height: u32,
     /// One of these: a picture file (or `data:` URL), base64 RGBA8 (straight
-    /// alpha), or a child of the shader group.
+    /// alpha) or its bytes as a blob (`data`), or a child of the shader group.
     pub src: Option<String>,
     pub pixels: Option<String>,
+    pub data: Option<GlslData>,
     pub layer: Option<String>,
     /// Or a video's picture at a time.
     #[serde(default)]
@@ -480,8 +598,9 @@ pub struct GlslUpload {
     pub width: u32,
     pub height: u32,
     /// One of these: base64 RGBA8 (straight alpha, `width * height * 4`
-    /// bytes), a picture file, or a child of the shader group.
+    /// bytes) or its bytes as a blob (`data`), a picture file, or a child of the shader group.
     pub pixels: Option<String>,
+    pub data: Option<GlslData>,
     pub src: Option<String>,
     pub layer: Option<String>,
     /// `UNPACK_FLIP_Y_WEBGL` was set.
@@ -859,19 +978,16 @@ fn all_true() -> [bool; 4] {
 pub fn decode_texture(
     texture: &GlslTexture,
     base_dir: &std::path::Path,
+    blobs: Option<&std::path::Path>,
 ) -> std::result::Result<(Vec<u8>, u32, u32), String> {
     if let Some(video) = &texture.video {
         return decode_video(video, base_dir);
     }
-    if texture.src.is_none() && texture.pixels.is_none() {
+    let pixels = payload(texture.pixels.as_deref(), texture.data.as_ref(), GlslEncoding::Rgba8, blobs)?;
+    if texture.src.is_none() && pixels.is_none() {
         return Err("a texture has either a src, pixels or a video (or, in a group, a layer)".into());
     }
-    decode_picture(
-        texture.src.as_deref(),
-        texture.pixels.as_deref(),
-        (texture.width, texture.height),
-        base_dir,
-    )
+    decode_picture(texture.src.as_deref(), pixels, (texture.width, texture.height), base_dir)
 }
 
 /// The straight RGBA8 pixels and size of a video's picture at a time, from the video decoder.
@@ -883,14 +999,13 @@ pub fn decode_video(
 }
 
 /// The straight RGBA8 pixels and size of a picture file (or `data:` URL)
-/// `src`, or of the base64 bytes `pixels` of a picture of `size`.
+/// `src`, or of the bytes `pixels` of a picture of `size`.
 pub fn decode_picture(
     src: Option<&str>,
-    pixels: Option<&str>,
+    pixels: Option<Bytes<'_>>,
     (w, h): (u32, u32),
     base_dir: &std::path::Path,
 ) -> std::result::Result<(Vec<u8>, u32, u32), String> {
-    use base64::Engine as _;
     match (src, pixels) {
         (Some(src), None) => {
             let decoded = if let Some(bytes) = crate::scene::data_uri_bytes(src) {
@@ -906,9 +1021,7 @@ pub fn decode_picture(
             Ok((decoded.into_raw(), w, h))
         }
         (None, Some(pixels)) => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(pixels)
-                .map_err(|e| format!("a texture's pixels are not base64: {e}"))?;
+            let bytes = pixels.read().map_err(|e| format!("a texture's pixels: {e}"))?;
             if w == 0 || h == 0 || bytes.len() != w as usize * h as usize * 4 {
                 return Err(format!(
                     "a texture of {w} x {h} needs {} bytes of RGBA, got {}",
@@ -927,6 +1040,7 @@ pub fn decode_picture(
 pub fn decode_cube(
     texture: &GlslTexture,
     base_dir: &std::path::Path,
+    blobs: Option<&std::path::Path>,
 ) -> std::result::Result<Option<(Vec<Vec<u8>>, u32)>, String> {
     if texture.faces.is_empty() {
         return Ok(None);
@@ -938,18 +1052,14 @@ pub fn decode_cube(
         ));
     }
     let side = texture.width;
-    if texture.faces.iter().any(|f| f.floats.is_some()) {
+    if texture.faces.iter().any(GlslFace::has_floats) {
         return Err("decode_cube_floats reads a cube map of floats".into());
     }
     let mut faces = Vec::with_capacity(6);
     for (i, face) in texture.faces.iter().enumerate() {
-        let (mut rgba, w, h) = decode_picture(
-            face.src.as_deref(),
-            face.pixels.as_deref(),
-            (side, side),
-            base_dir,
-        )
-        .map_err(|e| format!("cube map face {i}: {e}"))?;
+        let (mut rgba, w, h) = payload(face.pixels.as_deref(), face.data.as_ref(), GlslEncoding::Rgba8, blobs)
+            .and_then(|pixels| decode_picture(face.src.as_deref(), pixels, (side, side), base_dir))
+            .map_err(|e| format!("cube map face {i}: {e}"))?;
         if w != side || h != side || side == 0 {
             return Err(format!(
                 "cube map face {i} is {w} x {h}; the faces must be {side} x {side}"
@@ -966,17 +1076,19 @@ pub fn decode_cube(
 #[allow(clippy::type_complexity)]
 pub fn decode_cube_floats(
     texture: &GlslTexture,
+    blobs: Option<&std::path::Path>,
 ) -> std::result::Result<Option<(Vec<Texels>, u32)>, String> {
-    if texture.faces.len() != 6 || texture.faces.iter().all(|f| f.floats.is_none()) {
+    if texture.faces.len() != 6 || !texture.faces.iter().any(GlslFace::has_floats) {
         return Ok(None);
     }
     let side = texture.width;
-    if texture.faces.iter().any(|f| f.floats.is_none() || f.float32 != texture.faces[0].float32) {
+    if texture.faces.iter().any(|f| !f.has_floats() || f.float32 != texture.faces[0].float32) {
         return Err("the faces of a cube map are all floats of one precision, or none".into());
     }
     let mut faces = Vec::with_capacity(6);
     for (i, face) in texture.faces.iter().enumerate() {
-        let texels = texels_of(side as usize, side as usize, 1, None, face.floats.as_deref(), face.float32)
+        let texels = payload(face.floats.as_deref(), face.data.as_ref(), GlslEncoding::RgbaF32Le, blobs)
+            .and_then(|floats| texels_of(side as usize, side as usize, 1, None, floats, face.float32))
             .map_err(|e| format!("cube map face {i}: {e}"))?;
         faces.push(texels);
     }
@@ -996,27 +1108,26 @@ pub enum Texels {
 
 /// The texels of a texture with `floats` or a 3D texture: its `pixels`, or its `floats` rounded to half
 /// floats (kept in full with `float32`), as `texImage2D` and `texImage3D` of a float format do.
-pub fn decode_texels(texture: &GlslTexture) -> std::result::Result<Texels, String> {
+pub fn decode_texels(texture: &GlslTexture, blobs: Option<&std::path::Path>) -> std::result::Result<Texels, String> {
     texels_of(
         texture.width as usize,
         texture.height as usize,
         (texture.depth as usize).max(1),
-        texture.pixels.as_deref(),
-        texture.floats.as_deref(),
+        payload(texture.pixels.as_deref(), texture.data.as_ref(), GlslEncoding::Rgba8, blobs)?,
+        payload(texture.floats.as_deref(), texture.data.as_ref(), GlslEncoding::RgbaF32Le, blobs)?,
         texture.float32,
     )
 }
 
-/// `decode_texels` of `w` x `h` x `d` texels given as base64 `pixels` or `floats`.
+/// `decode_texels` of `w` x `h` x `d` texels given as `pixels` or `floats`.
 fn texels_of(
     w: usize,
     h: usize,
     d: usize,
-    pixels: Option<&str>,
-    floats: Option<&str>,
+    pixels: Option<Bytes<'_>>,
+    floats: Option<Bytes<'_>>,
     float32: bool,
 ) -> std::result::Result<Texels, String> {
-    use base64::Engine as _;
     if w == 0 || h == 0 {
         return Err(format!("a texture of {w} x {h} x {d} has no texels"));
     }
@@ -1027,11 +1138,7 @@ fn texels_of(
         .and_then(|n| n.checked_mul(d))
         .filter(|n| n.checked_mul(16).is_some())
         .ok_or_else(too_big)?;
-    let decode = |data: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| format!("a 3D texture's texels are not base64: {e}"))
-    };
+    let decode = |data: Bytes<'_>| data.read().map_err(|e| format!("a texture's texels: {e}"));
     match (pixels, floats) {
         (Some(pixels), None) => {
             let bytes = decode(pixels)?;
@@ -1194,6 +1301,7 @@ mod tests {
             src: None,
             video: None,
             pixels,
+            data: None,
             layer: None,
             width: 2,
             height: 1,
@@ -1217,10 +1325,10 @@ mod tests {
             targets: Vec::new(),
             calls: Vec::new(),
         };
-        let rgba8 = decode_texels(&texture(Some(b64(&[7; 16])), None)).unwrap();
+        let rgba8 = decode_texels(&texture(Some(b64(&[7; 16])), None), None).unwrap();
         assert_eq!(rgba8, Texels::Rgba8(vec![7; 16]));
         let floats: Vec<u8> = (0..16).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        let Texels::Rgba16F(halves) = decode_texels(&texture(None, Some(b64(&floats)))).unwrap()
+        let Texels::Rgba16F(halves) = decode_texels(&texture(None, Some(b64(&floats))), None).unwrap()
         else {
             panic!("half floats");
         };
@@ -1229,8 +1337,8 @@ mod tests {
         // A 2D texture of 32-bit floats is kept in full.
         let mut full = texture(None, Some(b64(&floats[..32])));
         (full.depth, full.float32) = (0, true);
-        assert_eq!(decode_texels(&full).unwrap(), Texels::Rgba32F(floats[..32].to_vec()));
-        let e = decode_texels(&texture(Some(b64(&[0; 15])), None)).unwrap_err();
+        assert_eq!(decode_texels(&full, None).unwrap(), Texels::Rgba32F(floats[..32].to_vec()));
+        let e = decode_texels(&texture(Some(b64(&[0; 15])), None), None).unwrap_err();
         assert!(e.contains("needs 16 bytes"), "{e}");
     }
 }

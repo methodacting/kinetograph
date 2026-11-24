@@ -11,12 +11,12 @@
 // `WebGLUnsupportedError` whose message starts with "unsupported:" and says what to do instead; a call is never
 // accepted and then ignored where it would change the picture.
 
-import type { CanvasSource, GlslContent, GlslDraw, GlslProgram, GlslLayer, GlslOp, GlslOutput, GlslPatch, GlslSampler, GlslStencil, GlslStencilFace, GlslTexCall, GlslTexture, GlslUniform, GlslVideo } from './types.js';
+import type { BlobRef, CanvasSource, GlslContent, GlslData, GlslDraw, GlslProgram, GlslLayer, GlslOp, GlslOutput, GlslPatch, GlslSampler, GlslStencil, GlslStencilFace, GlslTexCall, GlslTexture, GlslUniform, GlslVideo } from './types.js';
 import { CANVAS_SOURCE, pictureOf, type CanvasPicture } from './canvas.js';
 import { preprocess } from './glsl-cpp.js';
 import { parseBlocks, type BlockInfo, type BlockUniform } from './webgl-blocks.js';
 import { arrayFits, COMPRESSED_EXTENSIONS, integerSign, isCompressedInternal, isIntegerInternal, texelSize, unpackBytes, type UnpackStore } from './webgl-texraw.js';
-import { carriedFor, carryOn, dependsOnHistory, emptyCarry, isCanvasOp, MAX_OPS_PER_TARGET, namedBy, noteClearBox, pick, readsLastFrame, type Resources } from './webgl-carry.js';
+import { carriedFor, carryOn, dependsOnHistory, emptyCarry, isCanvasOp, MAX_OPS_PER_TARGET, namedBy, noteClearBox, pick, readsLastFrame, type KeptBuffer, type Resources } from './webgl-carry.js';
 
 /** The method a picture of another layer answers a texture upload with (`layerPicture`). */
 export const LAYER_SOURCE: unique symbol = Symbol.for('kinetograph.layerSource');
@@ -584,7 +584,7 @@ export class WebGLBuffer extends WebGLObject {
   data: Uint8Array = new Uint8Array(0);
   /** Changes with the contents, so the recording keeps a snapshot once for each. */
   version = 0;
-  snapshot: { version: number; id: string; base64: string } | null = null;
+  snapshot: { version: number; id: string; kept: KeptBuffer } | null = null;
   usage: number = GL.STATIC_DRAW;
 }
 export class WebGLTexture extends WebGLObject {
@@ -981,6 +981,25 @@ export interface WebGLContextAttributesLike {
   [key: string]: unknown;
 }
 
+/**
+ * Where a recording's texture and buffer bytes go: each content once, as the file of `dir` named by the SHA-256 of its
+ * bytes, which the recording names (`GlslData`, `GlslBuffer`) in place of base64. A host that replays the recording in
+ * the same process (packages/compat/src/blobs.ts) sets one, so a frame's recording carries no bytes.
+ */
+export interface BlobSink {
+  /** The directory the recording names (`GlslContent.blobs`). */
+  readonly dir: string;
+  /** The ref of these bytes; the first put of a content writes it. */
+  put(bytes: Uint8Array): BlobRef;
+}
+
+let defaultSink: BlobSink | null = null;
+
+/** The sink of every context given none of its own (`WebGLContextOptions.blobs`); the host sets it before the page runs. */
+export function setBlobSink(sink: BlobSink | null): void {
+  defaultSink = sink;
+}
+
 export interface WebGLContextOptions {
   /** The drawing buffer's size now (it changes with `canvas.width`). */
   size: () => { width: number; height: number };
@@ -989,6 +1008,8 @@ export interface WebGLContextOptions {
   /** 1 for `webgl`, 2 for `webgl2`. */
   version?: 1 | 2;
   attributes?: WebGLContextAttributesLike;
+  /** Where its texture and buffer bytes go; `setBlobSink`'s without it, and base64 in the recording with neither. */
+  blobs?: BlobSink;
   /** The straight-alpha RGBA8 pixels of a canvas drawn into a texture, or null when they cannot be had. */
   rasterize?: (source: Extract<CanvasSource, { kind: 'canvas' }>) => Uint8Array | null;
   /** Told what a recording leaves out where the engine does not draw it right (the frame reports it as unsupported). */
@@ -1209,7 +1230,7 @@ export class WebGLContext {
 
   // What the ops refer to, by id.
   private readonly programs = new Map<string, GlslProgram>();
-  private readonly buffers = new Map<string, string>();
+  private readonly buffers = new Map<string, KeptBuffer>();
   private readonly textures = new Map<string, GlslTexture>();
 
   constructor(options: WebGLContextOptions) {
@@ -1247,8 +1268,9 @@ export class WebGLContext {
       ...(this.attributes.depth ? {} : { depth: false }),
       ...(this.attributes.stencil ? { stencil: true } : {}),
       ...(this.attributes.antialias ? { antialias: true } : {}),
+      ...(this.sink() === null ? {} : { blobs: this.sink()!.dir }),
       programs: Object.fromEntries(new Map([...pick(named.programs, this.carry.programs), ...(held?.programs ?? []), ...this.programs])),
-      buffers: Object.fromEntries(new Map([...pick(named.buffers, this.carry.buffers), ...(held?.buffers ?? []), ...this.buffers])),
+      buffers: Object.fromEntries([...new Map([...pick(named.buffers, this.carry.buffers), ...(held?.buffers ?? []), ...this.buffers])].map(([id, b]) => [id, b.json])),
       textures: Object.fromEntries(new Map([...pick(named.textures, this.carry.textures), ...(held?.textures ?? []), ...this.textures])),
       ops: carried.length === 0 ? frame : [...carried, ...frame],
     };
@@ -2071,9 +2093,9 @@ export class WebGLContext {
     const attributes = { a_position: 0 };
     const programId = `p${hashOf(JSON.stringify([vertex, fragment, attributes]))}`;
     if (!this.programs.has(programId)) this.programs.set(programId, { vertex, fragment, attributes });
-    const quad = toBase64(new Uint8Array(new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]).buffer));
-    const buffer = `b${hashOf(quad)}`;
-    if (!this.buffers.has(buffer)) this.buffers.set(buffer, quad);
+    const quad = this.keptBuffer(new Uint8Array(new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]).buffer));
+    if (!this.buffers.has(quad.id)) this.buffers.set(quad.id, quad.kept);
+    const buffer = quad.id;
     const box: [number, number, number, number] = [x0, y0, x1 - x0, y1 - y0];
     const face: GlslStencilFace = { func: 'ALWAYS', fail: 'REPLACE', zfail: 'REPLACE', zpass: 'REPLACE' };
     const draw: GlslDraw = {
@@ -3575,7 +3597,7 @@ export class WebGLContext {
     if (xoffset < 0 || yoffset < 0 || xoffset + width > texture.width || yoffset + height > texture.height) return this.fail(GL.INVALID_VALUE);
     const unpack = this.unpackOf(rest.length >= 5 ? null : rest[2]);
     const flags = { ...(unpack.flipY ? { flipY: true } : {}), ...(unpack.premultiply ? { premultiply: true } : {}) };
-    const json = () => ('pixels' in part ? { pixels: toBase64(part.pixels) } : part);
+    const json = () => ('pixels' in part ? this.rgba8(part.pixels) : part);
     if (texture.drawnAt === texture.version) {
       // The bytes of an upload are RGBA8, which an R8 or RG8 target does not hold.
       if (texture.format === GL2.R8 || texture.format === GL2.RG8) throw new WebGLUnsupportedError('texSubImage2D into an R8 or RG8 texture a framebuffer drew in; draw into it, or upload the whole texture again');
@@ -4385,13 +4407,40 @@ export class WebGLContext {
   }
 
   private bufferId(buffer: WebGLBuffer): string {
-    if (buffer.snapshot?.version !== buffer.version) {
-      const base64 = toBase64(buffer.data);
-      buffer.snapshot = { version: buffer.version, id: `b${hashOf(base64)}`, base64 };
-    }
-    const { id, base64 } = buffer.snapshot;
-    if (!this.buffers.has(id)) this.buffers.set(id, base64);
+    if (buffer.snapshot?.version !== buffer.version) buffer.snapshot = { version: buffer.version, ...this.keptBuffer(buffer.data) };
+    const { id, kept } = buffer.snapshot;
+    if (!this.buffers.has(id)) this.buffers.set(id, kept);
     return id;
+  }
+
+  /** The sink this context's bytes go to, if any. */
+  private sink(): BlobSink | null {
+    return this.options.blobs ?? defaultSink;
+  }
+
+  /** A buffer's bytes as the recording keeps them (a copy: the page may write the array again), and an id of what they are. */
+  private keptBuffer(data: Uint8Array): { id: string; kept: KeptBuffer } {
+    const bytes = data.slice();
+    const sink = this.sink();
+    if (sink === null) {
+      const base64 = toBase64(bytes);
+      return { id: `b${hashOf(base64)}`, kept: { json: base64, bytes } };
+    }
+    const blob = sink.put(bytes);
+    return { id: `b${blob.slice(7, 23)}`, kept: { json: { blob }, bytes } };
+  }
+
+  /** RGBA8 texels as the recording carries them: a blob with a sink, base64 `pixels` without. */
+  private rgba8(bytes: Uint8Array): { pixels: string } | { data: GlslData } {
+    const sink = this.sink();
+    return sink === null ? { pixels: toBase64(bytes) } : { data: { blob: sink.put(bytes), encoding: 'rgba8' } };
+  }
+
+  /** Float texels (four `f32`s each) as the recording carries them: a blob with a sink, base64 `floats` without. */
+  private f32(floats: Float32Array): { floats: string } | { data: GlslData } {
+    const bytes = new Uint8Array(floats.buffer, floats.byteOffset, floats.byteLength);
+    const sink = this.sink();
+    return sink === null ? { floats: toBase64(bytes) } : { data: { blob: sink.put(bytes), encoding: 'rgba-f32-le' } };
   }
 
   /** The texture's state at this draw: its pixels (once, by id) and how this unit samples it. */
@@ -4460,8 +4509,8 @@ export class WebGLContext {
     if (!this.cubeComplete(cube)) return { cube: true, faces: [] };
     const faces = cube.faces!.map((f) => ({
       ...(f.floats !== null
-        ? { floats: toBase64(new Uint8Array(f.floats.buffer, f.floats.byteOffset, f.floats.byteLength)), ...(f.float32 ? { float32: true } : {}) }
-        : f.video !== null ? { pixels: toBase64(this.videoFace(f)) } : f.src !== null ? { src: f.src } : { pixels: toBase64(f.pixels ?? new Uint8Array(0)) }),
+        ? { ...this.f32(f.floats), ...(f.float32 ? { float32: true } : {}) }
+        : f.video !== null ? this.rgba8(this.videoFace(f)) : f.src !== null ? { src: f.src } : this.rgba8(f.pixels ?? new Uint8Array(0))),
       ...(f.flipY ? { flipY: true } : {}),
       ...(f.premultiply ? { premultiply: true } : {}),
     }));
@@ -4493,7 +4542,7 @@ export class WebGLContext {
     if (texture.snapshot?.version !== texture.version) {
       const json: GlslTexture = texture.raw !== null ? this.rawJson(texture) : texture.faces !== null ? this.cubeJson(texture) : texture.depth > 0 || texture.floats !== null
         ? {
-            ...(texture.floats !== null ? { floats: toBase64(new Uint8Array(texture.floats.buffer, texture.floats.byteOffset, texture.floats.byteLength)), ...(texture.float32 ? { float32: true } : {}) } : { pixels: toBase64(texture.pixels ?? new Uint8Array(0)) }),
+            ...(texture.floats !== null ? { ...this.f32(texture.floats), ...(texture.float32 ? { float32: true } : {}) } : this.rgba8(texture.pixels ?? new Uint8Array(0))),
             width: texture.width,
             height: texture.height,
             ...(texture.depth > 0 ? { depth: texture.depth } : {}),
@@ -4507,7 +4556,7 @@ export class WebGLContext {
             ? { video: texture.video }
             : texture.src !== null
               ? { src: texture.src }
-              : { pixels: toBase64(texture.pixels ?? new Uint8Array(0)) }),
+              : this.rgba8(texture.pixels ?? new Uint8Array(0))),
         ...(texture.pixels !== null ? { width: texture.width, height: texture.height } : {}),
         ...(texture.flipY ? { flipY: true } : {}),
         ...(texture.premultiply ? { premultiply: true } : {}),

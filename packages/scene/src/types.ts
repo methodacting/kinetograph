@@ -827,6 +827,24 @@ export interface GlslVideo {
   time: number;
 }
 
+/** The SHA-256 of a blob's bytes, `sha256:<64 hex>`: the file `<hex>` of the recording's blob directory (`GlslContent.blobs`). */
+export type BlobRef = `sha256:${string}`;
+
+/** How a payload's bytes are laid out: RGBA8 (straight alpha), or four little-endian `f32`s a texel. */
+export type GlslEncoding = 'rgba8' | 'rgba-f32-le';
+
+/**
+ * A payload a host's blob sink wrote (`setBlobSink`), in place of the base64 `pixels` or `floats` beside it: the hash
+ * names the bytes, and the encoding says how they are laid out (`rgba8` for `pixels`, `rgba-f32-le` for `floats`).
+ */
+export interface GlslData {
+  blob: BlobRef;
+  encoding: GlslEncoding;
+}
+
+/** A buffer's bytes (`bufferData`): base64, or a blob a host's sink wrote. */
+export type GlslBuffer = string | { blob: BlobRef };
+
 export interface GlslTexture {
   /** A picture file relative to the scene, or a `data:` URL. */
   /** Instead of `src` or `pixels`: the frame of a video file at a time, which the renderer decodes with the video decoder (`texImage2D` of a `<video>`). */
@@ -834,6 +852,8 @@ export interface GlslTexture {
   src?: string;
   /** Base64 RGBA8, straight alpha. */
   pixels?: string;
+  /** Instead of `pixels` or `floats`: their bytes, a blob. */
+  data?: GlslData;
   /** The `id` of a child of the shader group the recording belongs to: the texture is that layer, drawn. */
   layer?: string;
   width?: number;
@@ -934,6 +954,8 @@ export interface GlslTexCall {
 export interface GlslFace {
   src?: string;
   pixels?: string;
+  /** Instead of `pixels` or `floats`: their bytes, a blob. */
+  data?: GlslData;
   /** Instead of a picture or pixels: float texels (`RGBA16F`, `RGBA32F`, ...), base64 little-endian `f32`s, four for each, kept as half floats or in full with `float32`. */
   floats?: string;
   float32?: boolean;
@@ -951,6 +973,8 @@ export interface GlslPatch {
   video?: GlslVideo;
   src?: string;
   pixels?: string;
+  /** Instead of `pixels`: their bytes, a blob. */
+  data?: GlslData;
   layer?: string;
   flipY?: boolean;
   premultiply?: boolean;
@@ -1122,8 +1146,9 @@ export interface GlslUpload {
   y: number;
   width: number;
   height: number;
-  /** One of: base64 RGBA8 (straight alpha), a picture file, or a child of the shader group. */
+  /** One of: base64 RGBA8 (straight alpha), its bytes as a blob (`data`), a picture file, or a child of the shader group. */
   pixels?: string;
+  data?: GlslData;
   src?: string;
   layer?: string;
   flipY?: boolean;
@@ -1152,9 +1177,10 @@ export interface GlslContent {
   stencil?: boolean;
   /** The context's `antialias` attribute: the drawing buffer is multisampled (4 samples). */
   antialias?: boolean;
+  /** The directory of the recording's blobs (`GlslData`, `GlslBuffer`): each is the file named by its hash, written once. */
+  blobs?: string;
   programs: Record<string, GlslProgram>;
-  /** Base64 bytes. */
-  buffers: Record<string, string>;
+  buffers: Record<string, GlslBuffer>;
   textures: Record<string, GlslTexture>;
   ops: GlslOp[];
   /** What a WebGPU context did (the other fields are empty then). */

@@ -42,7 +42,11 @@ const uniforms = (gl: WebGLContext, program: ReturnType<typeof link>, pname: num
 };
 
 const draws = (gl: WebGLContext) => gl.content().ops.flatMap((op) => (op.op === 'draw' ? [op] : []));
-const bytesOf = (gl: WebGLContext, id: string) => Uint8Array.from(Buffer.from(gl.content().buffers[id]!, 'base64'));
+const bytesOf = (gl: WebGLContext, id: string) => {
+  const buffer = gl.content().buffers[id];
+  if (typeof buffer !== 'string') throw new Error(`buffer ${id} is not base64`);
+  return Uint8Array.from(Buffer.from(buffer, 'base64'));
+};
 
 describe('uniform blocks', () => {
   const BLOCKS = `

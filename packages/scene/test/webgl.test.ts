@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { MAX_OPS_PER_TARGET } from '../src/webgl-carry.js';
 import { createWebGLContext, glslShader, GL, GL2, ImageData, layerPicture, VideoFramePicture, WebGLUnsupportedError, type WebGLContext } from '../src/index.js';
 
@@ -46,7 +47,9 @@ describe('the recording WebGL context', () => {
     expect(draw.attributes.p).toMatchObject({ size: 2, type: 'f32', stride: 0, offset: 0 });
     expect(Object.keys(content.programs)).toHaveLength(1);
     expect(content.programs[draw.program]!.attributes).toEqual({ p: 0 });
-    expect(Buffer.from(content.buffers[draw.attributes.p!.buffer]!, 'base64')).toHaveLength(24);
+    const vertices = content.buffers[draw.attributes.p!.buffer];
+    if (typeof vertices !== 'string') throw new Error('the vertices are not base64');
+    expect(Buffer.from(vertices, 'base64')).toHaveLength(24);
   });
 
   it('keeps one program and one buffer for draws that share them, and drops all at a clear', () => {
@@ -56,6 +59,42 @@ describe('the recording WebGL context', () => {
     expect(Object.keys(gl.content().buffers)).toHaveLength(1);
     gl.clear(GL.COLOR_BUFFER_BIT);
     expect(gl.content().ops).toHaveLength(1);
+  });
+
+  it('with a blob sink, names texture and buffer data by the hash of its bytes, and puts each content once across frames', () => {
+    const puts: string[] = [];
+    const sha256 = (bytes: Uint8Array) => `sha256:${createHash('sha256').update(bytes).digest('hex')}` as const;
+    const blobs = { dir: '/tmp/blobs', put: (bytes: Uint8Array) => (puts.push(sha256(bytes)), sha256(bytes)) };
+    const gl = createWebGLContext({ size: () => ({ width: 8, height: 4 }), blobs });
+    const program = gl.createProgram();
+    for (const [type, source] of [[GL.VERTEX_SHADER, VERTEX], [GL.FRAGMENT_SHADER, FRAGMENT]] as const) {
+      const shader = gl.createShader(type)!;
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      gl.attachShader(program, shader);
+    }
+    gl.linkProgram(program);
+    gl.useProgram(program);
+    const vertices = new Float32Array([-1, -1, 1, -1, -1, 1]);
+    gl.bindBuffer(GL.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(GL.ARRAY_BUFFER, vertices, GL.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, GL.FLOAT, false, 0, 0);
+    const texels = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
+    gl.bindTexture(GL.TEXTURE_2D, gl.createTexture());
+    gl.texImage2D(GL.TEXTURE_2D, 0, GL.RGBA, 2, 2, 0, GL.RGBA, GL.UNSIGNED_BYTE, texels);
+    const frames = [0, 1, 2].map(() => {
+      gl.clear(GL.COLOR_BUFFER_BIT);
+      gl.drawArrays(GL.TRIANGLES, 0, 3);
+      return JSON.parse(JSON.stringify(gl.content())) as ReturnType<WebGLContext['content']>;
+    });
+    for (const content of frames) {
+      expect(content.blobs).toBe('/tmp/blobs');
+      expect(Object.values(content.buffers)).toEqual([{ blob: sha256(new Uint8Array(vertices.buffer)) }]);
+      expect(Object.values(content.textures)).toEqual([expect.objectContaining({ data: { blob: sha256(texels), encoding: 'rgba8' } })]);
+      expect(JSON.stringify(content)).not.toContain('pixels');
+    }
+    expect(puts.sort()).toEqual([sha256(new Uint8Array(vertices.buffer)), sha256(texels)].sort());
   });
 
   it('records a NaN uniform as null (the replay reads it as NaN) and an infinity as a number past a float', () => {
