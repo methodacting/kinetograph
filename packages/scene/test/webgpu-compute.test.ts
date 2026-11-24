@@ -617,11 +617,12 @@ describe('the log of a frame: what it depends on', () => {
       const webgpu = context.content().webgpu!;
       const [compute, render] = webgpu.passes;
       expect(webgpu.passes.map((p) => p.k)).toEqual(['compute', 'render']);
+      if (compute?.k !== 'compute' || render?.k !== 'render') throw new Error('a compute pass then a render pass');
       // The render pass draws into the canvas what the compute pass wrote; earlier frames' textures went with their frames.
       expect(render).not.toHaveProperty('target');
-      const written = textureOf(webgpu, compute!.commands);
+      const written = textureOf(webgpu, compute.commands);
       expect(written).toBeDefined();
-      expect(textureOf(webgpu, render!.commands)).toBe(written);
+      expect(textureOf(webgpu, render.commands)).toBe(written);
       expect(Object.keys(webgpu.textures!)).toEqual([written]);
       expect(webgpu.impure).toBeUndefined();
       seen.add(written!);

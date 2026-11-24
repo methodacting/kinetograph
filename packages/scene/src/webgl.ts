@@ -3590,9 +3590,10 @@ export class WebGLContext {
       for (let y = 0; y < height; y += 1) {
         held.set(part.pixels.subarray(y * width * 4, (y + 1) * width * 4), ((yoffset + y) * texture.width + xoffset) * 4);
       }
-    } else if (xoffset === 0 && yoffset === 0 && width === texture.width && height === texture.height) {
-      // Over the whole texture (three.js fills a texStorage2D so), it is the texture's picture: nothing it held is left.
-      Object.assign(texture, { pixels: 'pixels' in part ? part.pixels : null, src: 'src' in part ? part.src : null, video: 'video' in part ? part.video : null, layer: 'layer' in part ? part.layer : null, flipY: unpack.flipY, premultiply: unpack.premultiply, patches: [] });
+    } else if ('pixels' in part && texture.blank && xoffset === 0 && yoffset === 0 && width === texture.width && height === texture.height) {
+      // Pixels over the whole of a texture that holds nothing yet (three.js fills a texStorage2D with a flipped canvas so)
+      // are its picture: the blank storage is not recorded under them.
+      Object.assign(texture, { pixels: part.pixels, src: null, video: null, layer: null, flipY: unpack.flipY, premultiply: unpack.premultiply, patches: [] });
     } else {
       texture.patches.push({ x: xoffset, y: yoffset, width, height, ...json(), ...flags });
     }
