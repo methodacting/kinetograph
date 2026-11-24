@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Links the LGPL-only static ffmpeg (scripts/build-ffmpeg.sh), as kinetograph-node's feature of the same name does, so
+# that this crate's own tests build against it in CI.
+ffmpeg-static = ["ffmpeg/static"]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 skia-safe = { version = "0.153.3", features = ["metal", "graphite"] }
 objc2 = { version = "0.6" }
