@@ -1,0 +1,79 @@
+# Fork only (methodacting/kinetograph): publishes the JS packages motionactor installs to the fleet registry as
+# `@motionactor/kinetograph-<name>` (scripts/ma-alias.mjs), from the commit a green native.yml run on ma/main built, so
+# the JS and the addons motionactor publishes from that run's artifacts (its packages/vendor) are one build. Started by
+# pushing a tag `ma/v<version>` on that commit, version `0.4.0-main.<upstream short sha>.<build>` (a tag push runs this
+# file as the tagged commit has it; workflow_dispatch would need it on the fork's default branch). Needs the repository
+# secret RUNACTOR_NPM_PUBLISH_TOKEN.
+name: publish (motionactor)
+
+on:
+  push:
+    tags: ['ma/v*']
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # The version names the upstream commit, which must be under this one; a green native.yml run on ma/main must
+      # have built this very commit.
+      - name: Check the version and the native run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          version=${GITHUB_REF_NAME#ma/v}
+          upstream=$(echo "$version" | sed -n 's/^[0-9]*\.[0-9]*\.[0-9]*-main\.\([0-9a-f]*\)\.[0-9]*$/\1/p')
+          test -n "$upstream"
+          git merge-base --is-ancestor "$upstream" HEAD
+          git merge-base --is-ancestor HEAD origin/ma/main
+          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow native.yml --branch ma/main --commit "$GITHUB_SHA" --status success --json databaseId --jq length)
+          test "$runs" -gt 0
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # In dependency order. Never `npm run build --workspaces`.
+      - name: Build the TypeScript packages and the studio UI
+        run: |
+          for p in scene compat react core audio video-matting cli; do npm run build -w "packages/$p"; done
+          npm run build -w @kinetographdev/studio-ui
+          npm run build -w @kinetographdev/studio
+          test -f packages/studio/ui/dist/index.html
+
+      - name: Check the package contents
+        run: node scripts/check-packages.mjs crates/node packages/scene packages/compat packages/react packages/core packages/audio packages/video-matting packages/studio packages/cli
+
+      - name: Rename for the fleet registry
+        run: node scripts/ma-alias.mjs "$VERSION"
+
+      - name: Publish
+        env:
+          RUNACTOR_NPM_TOKEN: ${{ secrets.RUNACTOR_NPM_PUBLISH_TOKEN }}
+        run: |
+          set -e
+          echo '//runactor-npm.methodactor.workers.dev/:_authToken=${RUNACTOR_NPM_TOKEN}' >> "${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          registry=https://runactor-npm.methodactor.workers.dev
+          # A package whose version is already on the registry is skipped, so a run that stopped partway can be started again.
+          publish() {
+            n=$(node -p "require('./$1/package.json').name"); v=$(node -p "require('./$1/package.json').version")
+            if npm view "$n@$v" version --registry "$registry" >/dev/null 2>&1; then echo "$n@$v is already published, skipping"; return; fi
+            (cd "$1" && npm publish --tag main)
+          }
+          # Each after what it depends on: native; scene; compat (scene); react (compat); core (compat, native, react);
+          # audio (native); video-matting (native); studio (core, native; cli is a peer); cli (all of those).
+          for d in crates/node packages/scene packages/compat packages/react packages/core packages/audio packages/video-matting packages/studio packages/cli; do
+            publish "$d"
+          done
