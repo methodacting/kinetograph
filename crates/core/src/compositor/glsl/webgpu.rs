@@ -21,6 +21,8 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use super::*;
+// WebGPU recordings still carry their buffers as base64 (blob transport is WebGL only).
+use base64::Engine as _;
 use crate::video::{VideoDecoder, VideoInfo};
 use crate::webgpu::{self as wg, Command, Source, Step, WebGpuContent};
 
