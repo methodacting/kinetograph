@@ -8,17 +8,33 @@
 // file in a `<script>` for Chrome, which draws it with a real WebGL context, and the recording this writes to
 // `<name>.json` goes in the canvas's `data-kg-webgl` for the engine, which runs the shaders natively: the test
 // compares the two pictures. The case's size is its first line, `// size: 96 64`. Run this again after changing a case
-// or the recorder (`npm run build -w packages/scene` first).
+// or the recorder (`npm run build -w packages/scene` first). The payloads go in `tests/assets/webgl-blobs`, which the
+// recordings name relative to the test pages' base directory, `tests/assets`.
 //
 // Chrome is a test oracle here and nowhere else.
 
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createWebGLContext } from '../../../packages/scene/dist/index.js';
+import { createWebGLContext, setBlobSink } from '../../../packages/scene/dist/index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dir = resolve(here, '../tests/webgl');
+const blobs = resolve(here, '../tests/assets/webgl-blobs');
+
+setBlobSink({
+  dir: 'webgl-blobs',
+  put(bytes) {
+    const hex = createHash('sha256').update(bytes).digest('hex');
+    const file = join(blobs, hex);
+    if (!existsSync(file)) {
+      mkdirSync(blobs, { recursive: true });
+      writeFileSync(file, bytes);
+    }
+    return `sha256:${hex}`;
+  },
+});
 
 /** The recording case `source` makes on a drawing buffer of `width` x `height`, with the context attributes of its second line (`// attributes: {...}`). */
 export function record(source, width, height) {

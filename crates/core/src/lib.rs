@@ -1,6 +1,7 @@
 //! Scene graph and GPU compositor for Kinetograph.
 
 pub mod anim;
+pub mod blobs;
 pub mod blur;
 pub mod bounds;
 pub mod bsp;

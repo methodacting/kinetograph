@@ -127,13 +127,17 @@ fn shader_group(texture: &str) -> String {
         void main() { gl_FragColor = vec4(texture2D(u_a, vec2(v_uv.x, 1.0 - v_uv.y)).rgb, 1.0); }";
     let corners: [f32; 12] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0];
     let bytes: Vec<u8> = corners.iter().flat_map(|f| f.to_le_bytes()).collect();
-    use base64::Engine as _;
-    let quad = base64::engine::general_purpose::STANDARD.encode(bytes);
+    // The quad as a blob of a directory of the test's own (any 64 hex digits name it: the reader does not hash).
+    let blobs = std::env::temp_dir().join(format!("kinetograph-canvas-pass-blobs-{}", std::process::id()));
+    std::fs::create_dir_all(&blobs).unwrap();
+    let quad = format!("sha256:{:064x}", bytes.len());
+    std::fs::write(blobs.join(&quad[7..]), &bytes).unwrap();
+    let blobs = serde_json::to_string(&blobs).unwrap();
     format!(
         r#"{{"id": "pass", "type": "group", "children": [{}],
             "glsl": {{"width": 16, "height": 16,
               "programs": {{"p": {{"vertex": {}, "fragment": {}, "attributes": {{"a_pos": 0}}}}}},
-              "buffers": {{"quad": "{quad}"}},
+              "blobs": {blobs}, "buffers": {{"quad": {{"blob": "{quad}"}}}},
               "textures": {{"a": {texture}}},
               "ops": [{{"op": "draw", "program": "p", "mode": "triangles", "first": 0, "count": 6,
                  "attributes": {{"a_pos": {{"buffer": "quad", "size": 2, "type": "f32", "normalized": false, "stride": 0, "offset": 0}}}},

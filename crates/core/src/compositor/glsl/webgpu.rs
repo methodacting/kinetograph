@@ -744,7 +744,7 @@ impl Compositor {
         if let Some(p) = self.glsl.webgpu.pictures.get(&key) {
             return Ok(p.clone());
         }
-        let (rgba, width, height) = gl::decode_picture(Some(src), None, (0, 0), base_dir)?;
+        let (rgba, width, height) = gl::decode_src(src, base_dir)?;
         let limit = self.device.limits().max_texture_dimension_2d;
         if width > limit || height > limit {
             return Err(format!(
