@@ -7,6 +7,7 @@
 
 mod paintkit;
 
+use kinetograph_core::{Frame, Renderer, Scene, render_still};
 use paintkit::compare;
 
 fn case_file(name: &str, extension: &str) -> String {
@@ -87,6 +88,101 @@ fn webgl_noise() {
 #[test]
 fn webgl_texture() {
     run("webgl_texture", 2.0);
+    // One blob under three descriptions: 4 x 1 and 2 x 2 RGBA8, and 1 x 1 RGBA32F. Each third of the canvas shows its
+    // own picture, so a texture on the device is its description, never its bytes alone.
+    let recording = case_file("webgl_blob_descriptions", "json");
+    let content: serde_json::Value = serde_json::from_str(&recording).unwrap();
+    let blobs: std::collections::BTreeSet<&str> = content["textures"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|t| t["data"]["blob"].as_str().unwrap())
+        .collect();
+    assert_eq!(blobs.len(), 1, "the three textures name one blob");
+    let frame = paintkit::render_output(&painted(&recording, (48, 16)), 48, 16);
+    let near = |x: usize, y: usize, want: [u8; 3]| {
+        let got = px(&frame, x, y);
+        assert!(
+            (0..3).all(|c| got[c].abs_diff(want[c]) <= 1) && got[3] == 255,
+            "({x}, {y}) is {got:?}, not {want:?}"
+        );
+    };
+    // As 4 x 1: the four texels across.
+    for (x, want) in [(2, [200, 0, 128]), (6, [0, 200, 0]), (10, [0, 0, 200]), (14, [0, 0, 0])] {
+        near(x, 8, want);
+    }
+    // As 2 x 2: the first two texels are GL's bottom row.
+    near(20, 12, [200, 0, 128]);
+    near(28, 12, [0, 200, 0]);
+    near(20, 4, [0, 0, 200]);
+    near(28, 4, [0, 0, 0]);
+    // As one texel of four floats, about (1.0, 0.503, 0.391).
+    near(40, 8, [255, 128, 100]);
+}
+
+/// The page with the recording `recording` on a canvas of `(w, h)`, painted on a page of that size.
+fn painted(recording: &str, (w, h): (u32, u32)) -> kinetograph_dom::request::IslandOutput {
+    let body = format!(
+        "<canvas width=\"{w}\" height=\"{h}\" data-kg-webgl='{}' style=\"display:block\"></canvas>",
+        recording.trim()
+    );
+    paintkit::paint_html(&paintkit::page(&body), w, h)
+}
+
+/// The scene of `painted`, read as a render reads it (blobs relative to the pages' base directory).
+fn scene_of(recording: &str, (w, h): (u32, u32)) -> kinetograph_core::Result<Scene> {
+    let json = paintkit::scene_json(&painted(recording, (w, h)), w, h).to_string();
+    Scene::from_json(&json, paintkit::repo_root().join("crates/dom/tests/assets"))
+}
+
+fn px(frame: &Frame, x: usize, y: usize) -> [u8; 4] {
+    let i = (y * frame.width as usize + x) * 4;
+    frame.rgba[i..i + 4].try_into().unwrap()
+}
+
+#[test]
+fn a_later_frame_draws_the_target_it_carries_after_the_caches_forget_it() {
+    // The recording of a frame that only samples a target, carrying the draw and the upload that filled it.
+    let replay = case_file("webgl_blob_replay", "json");
+    let content: serde_json::Value = serde_json::from_str(&replay).unwrap();
+    let ops: Vec<&str> = content["ops"].as_array().unwrap().iter().map(|o| o["op"].as_str().unwrap()).collect();
+    assert_eq!(ops, ["draw", "upload", "draw"]);
+    let size = (48, 16);
+    let mut renderer = Renderer::new(scene_of(&replay, size).unwrap()).unwrap();
+    // Every payload but the one used last is forgotten as soon as another is kept.
+    renderer.set_glsl_budget(1);
+    let fresh = renderer.render_frame(0).unwrap();
+    // The left texel is the picture's red, the right the upload's green.
+    assert_eq!(px(&fresh, 4, 8), [255, 0, 0, 255]);
+    assert_eq!(px(&fresh, 12, 8), [0, 255, 0, 255]);
+    renderer
+        .set_scene(scene_of(&case_file("webgl_blob_descriptions", "json"), size).unwrap())
+        .unwrap();
+    renderer.render_frame(0).unwrap();
+    renderer.set_scene(scene_of(&replay, size).unwrap()).unwrap();
+    let again = renderer.render_frame(0).unwrap();
+    assert!(fresh.rgba == again.rgba, "the replay drew other pixels after the caches forgot it");
+}
+
+#[test]
+fn a_blob_that_is_misnamed_or_missing_fails_the_recording_by_name() {
+    let replay = case_file("webgl_blob_replay", "json");
+    let content: serde_json::Value = serde_json::from_str(&replay).unwrap();
+    let named = content["textures"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find_map(|t| t["data"]["blob"].as_str())
+        .unwrap();
+    // Not sha256:<64 hex>: the scene is refused.
+    let misnamed = "sha256:../../x";
+    let e = scene_of(&replay.replace(named, misnamed), (16, 16)).unwrap_err().to_string();
+    assert!(e.contains(misnamed), "{e}");
+    // Well named, with no file: the frame fails, naming it.
+    let missing = format!("sha256:{}", "0".repeat(64));
+    let scene = scene_of(&replay.replace(named, &missing), (16, 16)).unwrap();
+    let e = render_still(scene, 0).unwrap_err().to_string();
+    assert!(e.contains(&missing), "{e}");
 }
 
 #[test]

@@ -2,7 +2,8 @@
 //! (packages/cli/skills/kinetograph-markup/references/SCENE.md, "glsl"). The goldens in `golden.rs` cover the classic
 //! shaders; these pin the state and the data a draw is given.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use kinetograph_core::{Error, Frame, Scene, render_still};
@@ -14,12 +15,74 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// The directory of the tests' payloads, as a render's blob directory holds them: files named by their content.
+fn blob_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("kinetograph-core-glsl-blobs");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// `bytes` as a blob of `blob_dir`, by its name. The name is any 64 hex digits that tell contents apart: the reader
+/// does not hash what it reads.
+fn blob(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let name = format!("{:016x}{:048x}", hasher.finish(), bytes.len());
+    let path = blob_dir().join(&name);
+    if !path.exists() {
+        let partial = blob_dir().join(format!(
+            "{name}.{}-{}.partial",
+            std::process::id(),
+            WRITES.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&partial, bytes).unwrap();
+        std::fs::rename(&partial, &path).unwrap();
+    }
+    format!("sha256:{name}")
+}
+
+/// A buffer of `bytes`, as a recording's `buffers` name it.
+fn buffer(bytes: &[u8]) -> String {
+    format!(r#"{{"blob": "{}"}}"#, blob(bytes))
+}
+
+/// RGBA8 `bytes` as a texture's, a patch's or an upload's `data`.
+fn rgba8(bytes: &[u8]) -> String {
+    format!(r#"{{"blob": "{}", "encoding": "rgba8"}}"#, blob(bytes))
+}
+
+/// Little-endian `f32` `bytes`, four a texel, as a float texture's `data`.
+fn f32le(bytes: &[u8]) -> String {
+    format!(r#"{{"blob": "{}", "encoding": "rgba-f32-le"}}"#, blob(bytes))
+}
+
+/// The scene `json` with `blob_dir` as the directory of every recording in it.
+fn with_blobs(json: &str) -> String {
+    fn walk(value: &mut serde_json::Value, dir: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("programs") {
+                    map.insert("blobs".into(), dir.into());
+                }
+                map.values_mut().for_each(|v| walk(v, dir));
+            }
+            serde_json::Value::Array(list) => list.iter_mut().for_each(|v| walk(v, dir)),
+            _ => {}
+        }
+    }
+    let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+    walk(&mut value, &blob_dir().to_string_lossy());
+    value.to_string()
+}
+
 /// Two triangles over the whole clip space.
 fn quad() -> String {
     let corners: [f32; 12] = [
         -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
     ];
-    b64(&corners
+    buffer(&corners
         .iter()
         .flat_map(|f| f.to_le_bytes())
         .collect::<Vec<u8>>())
@@ -82,7 +145,7 @@ fn layer_with_vertex(
     format!(
         r#"{{"id": "g", "type": "glsl", "width": 16, "height": 16,
             "programs": {{{}}},
-            "buffers": {{"quad": "{}"{more_buffers}}}
+            "buffers": {{"quad": {}{more_buffers}}}
             {extra_content}, "ops": [{ops}]}}"#,
         programs.join(", "),
         quad()
@@ -98,7 +161,7 @@ fn scene_of(layers: &str) -> Scene {
         r##"{{"blendSpace": "linear", "width": 16, "height": 16, "fps": 30, "durationInFrames": 1, "background": "#000000",
             "layers": [{layers}]}}"##
     );
-    Scene::from_json(&json, Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")).unwrap()
+    Scene::from_json(&with_blobs(&json), Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")).unwrap()
 }
 
 fn render(layer: &str) -> Frame {
@@ -169,7 +232,7 @@ fn points_draw(first: u32, count: u32, extra: &str) -> String {
 }
 
 fn points_buffer(points: &[[f32; 2]]) -> String {
-    b64(&points
+    buffer(&points
         .iter()
         .flatten()
         .flat_map(|f| f.to_le_bytes())
@@ -188,7 +251,7 @@ fn points_are_squares_of_gl_point_size_with_a_point_coord() {
     let layer = layer_with_vertex(
         vertex,
         &[("p", fragment)],
-        &format!(r#", "pts": "{buffer}""#),
+        &format!(r#", "pts": {buffer}"#),
         "",
         &points_draw(0, 2, ""),
     );
@@ -221,7 +284,7 @@ fn a_point_centred_outside_the_clip_volume_is_not_drawn_and_gl_vertex_id_is_its_
     let layer = layer_with_vertex(
         vertex,
         &[("p", fragment)],
-        &format!(r#", "pts": "{buffer}""#),
+        &format!(r#", "pts": {buffer}"#),
         "",
         &points_draw(1, 2, ""),
     );
@@ -265,11 +328,11 @@ fn varyings_arrays_matrices_and_bools_reach_the_shader() {
 #[test]
 fn a_texture_unit_is_sampled_with_its_wrap_and_filter() {
     // 2 x 1 texture, red then green, sampled nearest and clamped.
-    let pixels = b64(&[255, 0, 0, 255, 0, 255, 0, 255]);
+    let pixels = rgba8(&[255, 0, 0, 255, 0, 255, 0, 255]);
     let frame = render(&layer(
         "precision mediump float; varying vec2 v_uv; uniform sampler2D u_tex; \
          void main() { gl_FragColor = texture2D(u_tex, vec2(v_uv.x, 0.5)); }",
-        &format!(r#", "textures": {{"t": {{"pixels": "{pixels}", "width": 2, "height": 1}}}}"#),
+        &format!(r#", "textures": {{"t": {{"data": {pixels}, "width": 2, "height": 1}}}}"#),
         &draw(
             r#""uniforms": {"u_tex": [{"kind": "i", "value": [3]}]},
                "units": {"3": {"texture": "t", "min": "NEAREST", "mag": "NEAREST",
@@ -284,11 +347,11 @@ fn a_texture_unit_is_sampled_with_its_wrap_and_filter() {
 fn a_texture_that_needs_mipmaps_it_lacks_is_black() {
     // WebGL's default minification filter reads mipmaps; with none the
     // texture is incomplete and samples as opaque black.
-    let pixels = b64(&[255, 0, 0, 255, 0, 255, 0, 255]);
+    let pixels = rgba8(&[255, 0, 0, 255, 0, 255, 0, 255]);
     let frame = render(&layer(
         "precision mediump float; varying vec2 v_uv; uniform sampler2D u_tex; \
          void main() { gl_FragColor = texture2D(u_tex, vec2(v_uv.x, 0.5)); }",
-        &format!(r#", "textures": {{"t": {{"pixels": "{pixels}", "width": 2, "height": 1}}}}"#),
+        &format!(r#", "textures": {{"t": {{"data": {pixels}, "width": 2, "height": 1}}}}"#),
         &draw(
             r#""uniforms": {"u_tex": [{"kind": "i", "value": [0]}]},
                "units": {"0": {"texture": "t"}}"#,
@@ -396,7 +459,7 @@ fn shader_group(fragment: &str) -> String {
         r#"{{"id": "pass", "type": "group", "children": [{}, {}],
             "glsl": {{"width": 16, "height": 16, "programs": {{"p": {{"vertex": {}, "fragment": {},
                        "attributes": {{"a_pos": 0}}}}}},
-              "buffers": {{"quad": "{}"}},
+              "buffers": {{"quad": {}}},
               "textures": {{"a": {{"layer": "a"}}, "b": {{"layer": "b"}}}},
               "ops": [{}]}}}}"#,
         rect("a", 8, 16, "#ff0000"),
@@ -672,9 +735,9 @@ fn a_draw_that_samples_its_own_target_is_refused() {
 
 #[test]
 fn a_target_must_be_a_target_texture_of_a_size_the_device_draws() {
-    let pixels = b64(&[255, 0, 0, 255]);
+    let pixels = rgba8(&[255, 0, 0, 255]);
     let plain =
-        format!(r#", "textures": {{"rt": {{"pixels": "{pixels}", "width": 1, "height": 1}}}}"#);
+        format!(r#", "textures": {{"rt": {{"data": {pixels}, "width": 1, "height": 1}}}}"#);
     let error = render_error(&layer_of(
         &[("f", FILL)],
         &plain,
@@ -816,12 +879,12 @@ fn a_blit_within_one_buffer_is_refused() {
 fn upload_op(target: &str, at: [u32; 2], size: [u32; 2], rgba: &[u8], flags: &str) -> String {
     format!(
         r#"{{"op": "upload", "target": "{target}", "x": {}, "y": {}, "width": {}, "height": {},
-            "pixels": "{}"{flags}}}"#,
+            "data": {}{flags}}}"#,
         at[0],
         at[1],
         size[0],
         size[1],
-        b64(rgba)
+        rgba8(rgba)
     )
 }
 
@@ -910,7 +973,7 @@ fn instanced_draws_advance_attributes_with_a_divisor_per_instance_and_count_gl_i
     let frame = render(&layer_with_vertex(
         vertex,
         &[("p", fragment)],
-        &format!(r#", "off": "{offsets}""#),
+        &format!(r#", "off": {offsets}"#),
         "",
         &draw,
     ));
@@ -943,7 +1006,7 @@ fn an_attribute_with_a_divisor_of_two_advances_every_second_instance() {
     let frame = render(&layer_with_vertex(
         vertex,
         &[("p", fragment)],
-        &format!(r#", "off": "{offsets}""#),
+        &format!(r#", "off": {offsets}"#),
         "",
         &draw,
     ));
@@ -1199,7 +1262,7 @@ fn a_program_with_ten_attributes_draws() {
     let layer = format!(
         r#"{{"id": "g", "type": "glsl", "width": 16, "height": 16,
             "programs": {{"p": {{"vertex": {}, "fragment": {}, "attributes": {{{}}}}}}},
-            "buffers": {{"quad": "{}"}}, "ops": [{draw}]}}"#,
+            "buffers": {{"quad": {}}}, "ops": [{draw}]}}"#,
         serde_json::to_string(&vertex).unwrap(),
         serde_json::to_string(fragment).unwrap(),
         locations.join(", "),
@@ -1620,7 +1683,7 @@ fn overhanging_glsl(radius: u32) -> Scene {
             "layers": [{{"id": "over", "type": "group", {effects} "transform": {{"x": -30, "y": -30}},
                 "children": [{glsl}]}}]}}"##
     );
-    Scene::from_json(&json, Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")).unwrap()
+    Scene::from_json(&with_blobs(&json), Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")).unwrap()
 }
 
 #[test]
@@ -1642,8 +1705,8 @@ const ES3_QUAD_FRAGMENT: &str = "#version 300 es\nprecision highp float; in vec4
 /// A 2 x 1 texture, red then green, as the layer's `textures`.
 fn red_green() -> String {
     format!(
-        r#", "textures": {{"t": {{"pixels": "{}", "width": 2, "height": 1}}}}"#,
-        b64(&[255, 0, 0, 255, 0, 255, 0, 255])
+        r#", "textures": {{"t": {{"data": {}, "width": 2, "height": 1}}}}"#,
+        rgba8(&[255, 0, 0, 255, 0, 255, 0, 255])
     )
 }
 
@@ -1714,8 +1777,8 @@ fn volume() -> String {
         }
     }
     format!(
-        r#", "textures": {{"v": {{"pixels": "{}", "width": 2, "height": 2, "depth": 2}}}}"#,
-        b64(&texels)
+        r#", "textures": {{"v": {{"data": {}, "width": 2, "height": 2, "depth": 2}}}}"#,
+        rgba8(&texels)
     )
 }
 
@@ -1773,15 +1836,14 @@ fn a_3d_texture_filters_trilinearly() {
 
 #[test]
 fn a_3d_texture_of_half_floats_keeps_values_beyond_one() {
-    use base64::Engine as _;
     // Two texels: (0.5, 0.25, 2.0, 1.0) and (4.0, 0.0, 0.0, 1.0).
     let floats: Vec<u8> = [0.5f32, 0.25, 2.0, 1.0, 4.0, 0.0, 0.0, 1.0]
         .iter()
         .flat_map(|f| f.to_le_bytes())
         .collect();
     let content = format!(
-        r#", "textures": {{"v": {{"floats": "{}", "width": 2, "height": 1, "depth": 1}}}}"#,
-        base64::engine::general_purpose::STANDARD.encode(floats)
+        r#", "textures": {{"v": {{"data": {}, "width": 2, "height": 1, "depth": 1}}}}"#,
+        f32le(&floats)
     );
     // 2.0 and 4.0 are kept, not clamped to 1: halved, they are 1.0 and 2.0.
     let read = volume_fragment(
@@ -1838,11 +1900,10 @@ const QUAD_VERTEX_ES1_AS_ES3: &str = "#version 300 es\nin vec2 a_pos; out vec2 v
 
 /// A float texture of `values` (four floats a texel) as the layer's `textures`.
 fn float_texture(values: &[f32], width: u32, float32: bool) -> String {
-    use base64::Engine as _;
     let bytes: Vec<u8> = values.iter().flat_map(|f| f.to_le_bytes()).collect();
     format!(
-        r#", "textures": {{"f": {{"floats": "{}", "width": {width}, "height": 1, "float32": {float32}}}}}"#,
-        base64::engine::general_purpose::STANDARD.encode(bytes)
+        r#", "textures": {{"f": {{"data": {}, "width": {width}, "height": 1, "float32": {float32}}}}}"#,
+        f32le(&bytes)
     )
 }
 
@@ -1931,7 +1992,7 @@ fn solid_cube() -> String {
 fn cube_of(faces: &[Vec<u8>; 6], side: u32, extra: &str) -> String {
     let faces: Vec<String> = faces
         .iter()
-        .map(|f| format!(r#"{{"pixels": "{}"}}"#, b64(f)))
+        .map(|f| format!(r#"{{"data": {}}}"#, rgba8(f)))
         .collect();
     format!(
         r#"{{"cube": true, "width": {side}, "height": {side}{extra}, "faces": [{}]}}"#,
@@ -2300,8 +2361,8 @@ fn layers() -> String {
         }
     }
     format!(
-        r#", "textures": {{"a": {{"pixels": "{}", "width": 2, "height": 2, "depth": 3, "array": true}}}}"#,
-        b64(&texels)
+        r#", "textures": {{"a": {{"data": {}, "width": 2, "height": 2, "depth": 3, "array": true}}}}"#,
+        rgba8(&texels)
     )
 }
 
@@ -2554,7 +2615,7 @@ fn instanced_matrix_draw(instances: u32) -> (String, String) {
             "viewport": [0, 0, 16, 16]}}"#,
         columns.join(", ")
     );
-    (draw, format!(r#", "m": "{}""#, b64(&bytes)))
+    (draw, format!(r#", "m": {}"#, buffer(&bytes)))
 }
 
 const MATRIX_VERTEX: &str = "#version 300 es\nin vec2 a_pos; in mat4 inst;\n\
@@ -2819,7 +2880,7 @@ fn line_layer(points: &[[f32; 2]], draw: &str) -> Frame {
     render(&layer_with_vertex(
         QUAD_VERTEX_ES1_AS_ES3,
         &[("p", frag)],
-        &format!(r#", "v": "{}""#, b64(&bytes)),
+        &format!(r#", "v": {}"#, buffer(&bytes)),
         "",
         draw,
     ))
@@ -2865,7 +2926,7 @@ fn a_line_loop_of_indices_closes_on_its_first_index() {
     let frame = render(&layer_with_vertex(
         QUAD_VERTEX_ES1_AS_ES3,
         &[("p", frag)],
-        &format!(r#", "v": "{}", "i": "{}""#, b64(&bytes), b64(&indices)),
+        &format!(r#", "v": {}, "i": {}"#, buffer(&bytes), buffer(&indices)),
         "",
         &line_draw("lineLoop", 4, extra),
     ));
@@ -2884,8 +2945,8 @@ fn lines_are_not_culled_or_offset() {
 
 fn grey_texture(srgb: bool) -> String {
     format!(
-        r#", "textures": {{"t": {{"pixels": "{}", "width": 1, "height": 1{}}}}}"#,
-        b64(&[188, 188, 188, 255]),
+        r#", "textures": {{"t": {{"data": {}, "width": 1, "height": 1{}}}}}"#,
+        rgba8(&[188, 188, 188, 255]),
         if srgb { r#", "srgb": true"# } else { "" }
     )
 }

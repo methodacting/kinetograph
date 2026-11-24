@@ -644,9 +644,9 @@ fn validate_shader_group(group: &Layer, g: &GroupLayer, glsl: &GlslLayer) -> Res
         let Some(child) = &texture.layer else {
             continue;
         };
-        if texture.src.is_some() || texture.pixels.is_some() {
+        if texture.src.is_some() || texture.data.is_some() {
             return bad(&format!(
-                "has the texture {id:?} with a layer and a src or pixels; it has one of them"
+                "has the texture {id:?} with a layer and a src or data; it has one of them"
             ));
         }
         if !g.children.iter().any(|c| &c.id == child) {

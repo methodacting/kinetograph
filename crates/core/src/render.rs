@@ -469,6 +469,11 @@ impl Renderer {
         self.compositor.take_pass_times()
     }
 
+    /// Keeps at most `bytes` of the payloads of WebGL recordings read and on the device (`Compositor::set_glsl_budget`).
+    pub fn set_glsl_budget(&mut self, bytes: u64) {
+        self.compositor.set_glsl_budget(bytes);
+    }
+
     /// Turns identical-frame reuse on or off (`reuse.rs`); a new renderer
     /// has it off. With it on, `start_frame` does not draw a frame whose
     /// resolved scene is equal to that of the frame started just before it,

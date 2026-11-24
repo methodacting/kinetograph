@@ -405,12 +405,17 @@ fn a_webgl_layer_after_an_rgba16float_webgpu_layer_of_its_size_draws_into_an_rgb
         .iter()
         .flat_map(|f| f.to_le_bytes())
         .collect();
+    // The quad as a blob of a directory of the test's own (any 64 hex digits name it: the reader does not hash).
+    let blobs = std::env::temp_dir().join(format!("kinetograph-webgpu-blobs-{}", std::process::id()));
+    std::fs::create_dir_all(&blobs).unwrap();
+    let name = format!("{:064x}", quad.len());
+    std::fs::write(blobs.join(&name), &quad).unwrap();
     let webgl = json!({"id": "gl", "type": "glsl", "width": 16, "height": 16,
         "programs": {"p": {
             "vertex": "attribute vec2 a_pos; void main() { gl_Position = vec4(a_pos * vec2(0.5, 1.0) - vec2(0.5, 0.0), 0.0, 1.0); }",
             "fragment": "precision mediump float; void main() { gl_FragColor = vec4(0.0, 0.0, 1.0, 1.0); }",
             "attributes": {"a_pos": 0}}},
-        "buffers": {"quad": b64(&quad)},
+        "blobs": blobs, "buffers": {"quad": {"blob": format!("sha256:{name}")}},
         "ops": [{"op": "draw", "program": "p", "mode": "triangles", "first": 0, "count": 6, "viewport": [0, 0, 16, 16],
                  "attributes": {"a_pos": {"buffer": "quad", "size": 2, "type": "f32"}}}]});
     let layers = json!([{"id": "g", "type": "glsl", "width": 16, "height": 16, "webgpu": wide}, webgl]);

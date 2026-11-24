@@ -11,7 +11,7 @@
 // `WebGLUnsupportedError` whose message starts with "unsupported:" and says what to do instead; a call is never
 // accepted and then ignored where it would change the picture.
 
-import type { CanvasSource, GlslContent, GlslDraw, GlslLayer, GlslOp, GlslOutput, GlslPatch, GlslSampler, GlslStencil, GlslStencilFace, GlslTexture, GlslUniform } from './types.js';
+import type { BlobRef, CanvasSource, GlslBuffer, GlslContent, GlslData, GlslDraw, GlslLayer, GlslOp, GlslOutput, GlslPatch, GlslProgram, GlslSampler, GlslStencil, GlslStencilFace, GlslTexture, GlslUniform } from './types.js';
 import { CANVAS_SOURCE, pictureOf, type CanvasPicture } from './canvas.js';
 import { preprocess } from './glsl-cpp.js';
 
@@ -466,7 +466,7 @@ export class WebGLBuffer extends WebGLObject {
   data: Uint8Array = new Uint8Array(0);
   /** Changes with the contents, so the recording keeps a snapshot once for each. */
   version = 0;
-  snapshot: { version: number; id: string; base64: string } | null = null;
+  snapshot: { version: number; id: string; blob: BlobRef } | null = null;
   usage: number = GL.STATIC_DRAW;
 }
 export class WebGLTexture extends WebGLObject {
@@ -838,6 +838,24 @@ export interface WebGLContextAttributesLike {
   [key: string]: unknown;
 }
 
+/**
+ * Where a recording's payloads go (texture and buffer data): each content once, as the file of its directory named by
+ * the SHA-256 of its bytes, which the recording names by ref. The recording itself carries no bytes.
+ */
+export interface BlobSink {
+  /** The directory the recording names (`GlslContent.blobs`): a path, or one relative to the scene's directory. */
+  readonly dir: string;
+  /** The ref of these bytes; the first put of a content writes it. */
+  put(bytes: Uint8Array): BlobRef;
+}
+
+let defaultSink: BlobSink | null = null;
+
+/** The sink of every context given none of its own (`WebGLContextOptions.blobs`); the host sets it before the page runs. */
+export function setBlobSink(sink: BlobSink | null): void {
+  defaultSink = sink;
+}
+
 export interface WebGLContextOptions {
   /** The drawing buffer's size now (it changes with `canvas.width`). */
   size: () => { width: number; height: number };
@@ -846,6 +864,8 @@ export interface WebGLContextOptions {
   /** 1 for `webgl`, 2 for `webgl2`. */
   version?: 1 | 2;
   attributes?: WebGLContextAttributesLike;
+  /** Where its payloads go; the one `setBlobSink` set without it. */
+  blobs?: BlobSink;
   /** The straight-alpha RGBA8 pixels of a canvas drawn into a texture, or null when they cannot be had. */
   rasterize?: (source: Extract<CanvasSource, { kind: 'canvas' }>) => Uint8Array | null;
 }
@@ -970,6 +990,94 @@ function isCanvasOp(op: GlslOp): boolean {
 }
 
 /**
+ * An op of an earlier recording that drew in render targets, with what it names. A texture keeps what was drawn in it
+ * from one frame to the next, as in a browser (three renders an environment's PMREM once, then samples it every
+ * frame), while each recording is replayed on its own: a frame that samples such a texture replays the ops that
+ * drew it first.
+ */
+interface DrawnBefore {
+  readonly op: GlslOp;
+  /** The levels it draws in (`target@level`), and of those, the ones it leaves nothing drawn before it in. */
+  readonly writes: readonly string[];
+  readonly covers: readonly string[];
+  /** The levels its draws and blits read. */
+  readonly reads: readonly string[];
+  readonly programs: readonly (readonly [string, Required<GlslProgram>])[];
+  readonly buffers: readonly (readonly [string, GlslBuffer])[];
+  readonly textures: readonly (readonly [string, GlslTexture])[];
+  /** Why another frame cannot replay it: it read what only its own frame had. */
+  readonly bound?: string;
+}
+
+const level = (id: string, at = 0) => `${id}@${at}`;
+
+/** Every level of the target `id`. */
+function levelsOf(id: string, textures: ReadonlyMap<string, GlslTexture>): string[] {
+  return Array.from({ length: textures.get(id)?.levels ?? 1 }, (_, at) => level(id, at));
+}
+
+/** The levels of targets an op draws in. */
+function writesOf(op: GlslOp): string[] {
+  if (op.op === 'upload') return [level(op.target)];
+  if (op.op === 'blit') return op.target === undefined ? [] : [level(op.target, op.level)];
+  const colour = [...(op.target === undefined ? [] : [level(op.target, op.level)]), ...(op.outputs ?? []).flatMap((o) => (o === null ? [] : [level(o.target, o.level)]))];
+  return [...new Set([...colour, ...(op.depthStencil === undefined ? [] : [level(op.depthStencil)])])];
+}
+
+/** The levels an op leaves nothing drawn before it in: those a clear takes whole, and those a blit fills from corner to corner. */
+function coversOf(op: GlslOp, textures: ReadonlyMap<string, GlslTexture>): string[] {
+  if (op.op === 'clear') {
+    const colour = op.color === undefined ? [] : [...(op.target === undefined ? [] : [level(op.target, op.level)]), ...(op.outputs ?? []).flatMap((o) => (o === null ? [] : [level(o.target, o.level)]))];
+    const ds = op.depthStencil === undefined ? undefined : textures.get(op.depthStencil)?.format;
+    const depth = (ds === 'depth' && op.depth !== undefined) || (ds === 'stencil' && op.stencil !== undefined) || (ds === 'depthStencil' && op.depth !== undefined && op.stencil !== undefined);
+    return [...colour, ...(depth ? [level(op.depthStencil!)] : [])];
+  }
+  if (op.op === 'blit' && op.target !== undefined && op.scissor === undefined && op.aspect === undefined) {
+    const json = textures.get(op.target);
+    const at = op.level ?? 0;
+    const [x0, y0, x1, y1] = op.to;
+    const whole = json?.width !== undefined && json.height !== undefined && Math.min(x0, x1) <= 0 && Math.min(y0, y1) <= 0 && Math.max(x0, x1) >= Math.max(1, json.width >> at) && Math.max(y0, y1) >= Math.max(1, json.height >> at);
+    return whole ? [level(op.target, at)] : [];
+  }
+  return [];
+}
+
+/** The levels of targets an op reads: every level of a target (or of a cube of targets) its draw samples, and a blit's source. */
+function readsOf(op: GlslOp, textures: ReadonlyMap<string, GlslTexture>): string[] {
+  if (op.op === 'blit') return op.src === undefined ? [] : [level(op.src, op.srcLevel)];
+  if (op.op !== 'draw') return [];
+  return Object.values(op.units).flatMap(({ texture }) => {
+    const json = textures.get(texture);
+    if (json?.target === true) return levelsOf(texture, textures);
+    return json?.targets?.flatMap((face) => levelsOf(face, textures)) ?? [];
+  });
+}
+
+/** The textures an op names, as the recording's `textures` holds them: what it samples (a cube with its faces) and draws in. */
+function texturesOf(op: GlslOp, textures: ReadonlyMap<string, GlslTexture>): string[] {
+  const outputs = op.op === 'clear' || op.op === 'draw' ? [op.target, ...(op.outputs ?? []).map((o) => o?.target), op.depthStencil] : op.op === 'blit' ? [op.src, op.target] : [op.target];
+  const sampled = op.op === 'draw' ? Object.values(op.units).flatMap(({ texture }) => [texture, ...(textures.get(texture)?.targets ?? [])]) : [];
+  return [...new Set([...outputs, ...sampled].filter((id): id is string => id !== undefined))];
+}
+
+/**
+ * The ops of `before` that leave what `needed` reads in the levels it names, in their order: walking back, an op that
+ * draws in a needed level is kept and what it reads is needed too, until an op that covers the level leaves nothing
+ * before it to need.
+ */
+function replayed(before: readonly DrawnBefore[], needed: Set<string>): DrawnBefore[] {
+  const kept: DrawnBefore[] = [];
+  for (let i = before.length - 1; i >= 0 && needed.size > 0; i--) {
+    const drawn = before[i]!;
+    if (!drawn.writes.some((at) => needed.has(at))) continue;
+    kept.push(drawn);
+    for (const at of drawn.covers) needed.delete(at);
+    for (const at of drawn.reads) needed.add(at);
+  }
+  return kept.reverse();
+}
+
+/**
  * `WebGLRenderingContext` (and, with `version: 2`, the `WebGL2RenderingContext` calls shader pages use) as a recorder.
  * `content()` is what the `glsl` layer is made of. A context keeps its objects (programs, buffers, textures) and its
  * state between frames as a browser's does; the drawing buffer is emptied by `resetState()` (the frame loop calls it
@@ -1027,9 +1135,13 @@ export class WebGLContext {
   private unpackAlignment = 4;
 
   // What the ops refer to, by id.
-  private readonly programs = new Map<string, { vertex: string; fragment: string; attributes: Record<string, number> }>();
-  private readonly buffers = new Map<string, string>();
+  private readonly programs = new Map<string, Required<GlslProgram>>();
+  private readonly buffers = new Map<string, GlslBuffer>();
   private readonly textures = new Map<string, GlslTexture>();
+  /** The ops of earlier recordings that drew what a target that can still be sampled holds (`keep`). */
+  private drawnBefore: DrawnBefore[] = [];
+  /** The texture or renderbuffer of each target id, at the version the id names, with its levels. */
+  private readonly targetsOwned = new Map<string, { owner: WebGLTexture | WebGLRenderbuffer; version: number; levels: number }>();
 
   constructor(options: WebGLContextOptions) {
     this.options = options;
@@ -1052,17 +1164,77 @@ export class WebGLContext {
 
   /** The recording: what the `glsl` layer holds. */
   content(): GlslContent {
+    const programs = new Map(this.programs);
+    const buffers = new Map(this.buffers);
+    const textures = new Map(this.textures);
+    const carried = replayed(this.drawnBefore, this.sampled());
+    for (const drawn of carried) {
+      if (drawn.bound !== undefined) throw new WebGLUnsupportedError(`sampling a texture an earlier frame drew in from ${drawn.bound}; draw it again in the frame that samples it`);
+      for (const [id, json] of drawn.programs) if (!programs.has(id)) programs.set(id, json);
+      for (const [id, json] of drawn.buffers) if (!buffers.has(id)) buffers.set(id, json);
+      for (const [id, json] of drawn.textures) if (!textures.has(id)) textures.set(id, json);
+    }
     return {
       premultipliedAlpha: this.attributes.premultipliedAlpha,
       alpha: this.attributes.alpha,
       ...(this.attributes.depth ? {} : { depth: false }),
       ...(this.attributes.stencil ? { stencil: true } : {}),
       ...(this.attributes.antialias ? { antialias: true } : {}),
-      programs: Object.fromEntries(this.programs),
-      buffers: Object.fromEntries(this.buffers),
-      textures: Object.fromEntries(this.textures),
-      ops: this.ops,
+      ...(this.sink() === null ? {} : { blobs: this.sink()!.dir }),
+      programs: Object.fromEntries(programs),
+      buffers: Object.fromEntries(buffers),
+      textures: Object.fromEntries(textures),
+      ops: carried.length === 0 ? this.ops : [...carried.map((drawn) => drawn.op), ...this.ops],
     };
+  }
+
+  /** The levels of targets this recording's ops read before they cover them: what earlier recordings drew in them. */
+  private sampled(): Set<string> {
+    const needed = new Set<string>();
+    for (let i = this.ops.length - 1; i >= 0; i--) {
+      const op = this.ops[i]!;
+      for (const at of coversOf(op, this.textures)) needed.delete(at);
+      for (const at of readsOf(op, this.textures)) needed.add(at);
+    }
+    return needed;
+  }
+
+  /**
+   * Keeps the ops of the recording that drew in targets, with what they name, for later frames that sample those
+   * targets; and lets go of every op kept before that no target still able to be sampled depends on.
+   */
+  private keep(): void {
+    for (const op of this.ops) {
+      const writes = writesOf(op);
+      if (writes.length === 0) continue;
+      const named = texturesOf(op, this.textures);
+      const textures = named.flatMap((id) => {
+        const json = this.textures.get(id);
+        return json === undefined ? [] : [[id, json] as const];
+      });
+      const buffers = op.op === 'draw' ? [...Object.values(op.attributes).map((a) => a.buffer), ...(op.indices === undefined ? [] : [op.indices.buffer])].flatMap((id) => {
+        const json = this.buffers.get(id);
+        return json === undefined ? [] : [[id, json] as const];
+      }) : [];
+      const program = op.op === 'draw' ? this.programs.get(op.program) : undefined;
+      const bound = op.op === 'blit' && op.src === undefined ? 'the drawing buffer' : (op.op === 'upload' && op.layer !== undefined) || textures.some(([, json]) => json.layer !== undefined || json.patches?.some((p) => p.layer !== undefined)) ? 'a layer' : undefined;
+      this.drawnBefore.push({
+        op,
+        writes,
+        covers: coversOf(op, this.textures),
+        reads: readsOf(op, this.textures),
+        programs: program === undefined || op.op !== 'draw' ? [] : [[op.program, program]],
+        buffers,
+        textures,
+        ...(bound === undefined ? {} : { bound }),
+      });
+    }
+    const live = new Set<string>();
+    for (const [id, { owner, version, levels }] of this.targetsOwned) {
+      if (owner.deleted || owner.version !== version) this.targetsOwned.delete(id);
+      else for (let at = 0; at < levels; at++) live.add(level(id, at));
+    }
+    this.drawnBefore = replayed(this.drawnBefore, live);
   }
 
   /** Whether anything was drawn or cleared. */
@@ -1078,12 +1250,14 @@ export class WebGLContext {
    * draws nothing draws nothing.
    */
   resetState(): void {
+    if (!this.stale) this.keep();
     this.stale = true;
     this.ops = [];
   }
 
   /** Empties the drawing buffer (`canvas.width` was set). */
   reset(): void {
+    if (!this.stale) this.keep();
     this.ops = [];
     this.programs.clear();
     this.buffers.clear();
@@ -1723,9 +1897,9 @@ export class WebGLContext {
     const attributes = { a_position: 0 };
     const programId = `p${hashOf(JSON.stringify([vertex, fragment, attributes]))}`;
     if (!this.programs.has(programId)) this.programs.set(programId, { vertex, fragment, attributes });
-    const quad = toBase64(new Uint8Array(new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]).buffer));
-    const buffer = `b${hashOf(quad)}`;
-    if (!this.buffers.has(buffer)) this.buffers.set(buffer, quad);
+    const quad = this.blob(new Uint8Array(new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]).buffer));
+    const buffer = `b${quad.slice(7, 23)}`;
+    if (!this.buffers.has(buffer)) this.buffers.set(buffer, { blob: quad });
     const box: [number, number, number, number] = [x0, y0, x1 - x0, y1 - y0];
     const face: GlslStencilFace = { func: 'ALWAYS', fail: 'REPLACE', zfail: 'REPLACE', zpass: 'REPLACE' };
     const draw: GlslDraw = {
@@ -2640,13 +2814,15 @@ export class WebGLContext {
   }
 
   /** WebGL 2's `texStorage3D`: a 3D or array texture of this size, zeros, of one level (more are refused: only level 0 is held). */
-  texStorage3D(target: number, levels: number, internalformat: number, width: number, height: number, depth: number): void {
+  texStorage3D(target: number, levelsArg: number, internalformat: number, widthArg: number, heightArg: number, depthArg: number): void {
+    // GLsizei arguments, truncated to integers as a browser converts them (as `texStorage2D`).
+    const [levels, width, height, depth] = [levelsArg, widthArg, heightArg, depthArg].map(Math.trunc) as [number, number, number, number];
     const bound = this.bound3d(target);
     if (bound === null) return;
     const { texture, limit } = bound;
-    if (!(Number.isInteger(levels) && levels >= 1)) return this.fail(GL.INVALID_VALUE);
+    if (!(levels >= 1)) return this.fail(GL.INVALID_VALUE);
     const sides = [width, height, depth];
-    if (!sides.every((v) => Number.isInteger(v) && v >= 1) || Math.max(width, height) > MAX_3D_TEXTURE_SIZE || depth > limit) return this.fail(GL.INVALID_VALUE);
+    if (!sides.every((v) => v >= 1) || Math.max(width, height) > MAX_3D_TEXTURE_SIZE || depth > limit) return this.fail(GL.INVALID_VALUE);
     if (levels > 1) throw new WebGLUnsupportedError('texStorage3D of more than one level; a 3D or array texture has one level');
     const float = FLOAT_FORMATS[internalformat];
     const format = float?.format ?? FORMATS_8BIT_3D[internalformat];
@@ -2666,7 +2842,6 @@ export class WebGLContext {
   private subFloats(texture: WebGLTexture, xoffset: number, yoffset: number, rest: unknown[]): void {
     const float = FLOAT_FORMATS[texture.format]!;
     if (rest.length < 5) throw new WebGLUnsupportedError('texSubImage2D into a float texture from a picture; use an array of floats');
-    if (this.flipY || this.premultiply) throw new WebGLUnsupportedError('texSubImage2D into a float texture with UNPACK_FLIP_Y_WEBGL or UNPACK_PREMULTIPLY_ALPHA_WEBGL on');
     if (texture.drawnAt === texture.version) throw new WebGLUnsupportedError('texSubImage2D into a float texture a framebuffer drew in; draw into it, or upload the whole texture again');
     const [width, height, format, type, source, srcOffset = 0] = rest as [number, number, number, number, ArrayBufferView | null, number | undefined];
     const numbers = [xoffset, yoffset, width, height];
@@ -2674,8 +2849,18 @@ export class WebGLContext {
     if (source === null || source === undefined) return this.fail(GL.INVALID_VALUE);
     const floats = this.floatTexels(float, format, type, width * height, source, Number(srcOffset));
     if (floats === null) return;
+    // UNPACK_PREMULTIPLY_ALPHA_WEBGL and UNPACK_FLIP_Y_WEBGL apply to the floats as in `specifyFloat`: flip-Y turns the
+    // rectangle's rows over (three.js uploads an HDR's floats this way).
+    if (this.premultiply) {
+      for (let i = 0; i < width * height; i += 1) {
+        for (let c = 0; c < 3; c += 1) floats[i * 4 + c]! *= floats[i * 4 + 3]!;
+      }
+    }
     const held = texture.floats!;
-    for (let y = 0; y < height; y += 1) held.set(floats.subarray(y * width * 4, (y + 1) * width * 4), ((yoffset + y) * texture.width + xoffset) * 4);
+    for (let y = 0; y < height; y += 1) {
+      const row = this.flipY ? height - 1 - y : y;
+      held.set(floats.subarray(row * width * 4, (row + 1) * width * 4), ((yoffset + y) * texture.width + xoffset) * 4);
+    }
     texture.blank = false;
     texture.version += 1;
   }
@@ -2729,12 +2914,12 @@ export class WebGLContext {
     }
     if (xoffset < 0 || yoffset < 0 || xoffset + width > texture.width || yoffset + height > texture.height) return this.fail(GL.INVALID_VALUE);
     const flags = { ...(this.flipY ? { flipY: true } : {}), ...(this.premultiply ? { premultiply: true } : {}) };
-    const json = 'pixels' in part ? { pixels: toBase64(part.pixels) } : part;
+    const json = () => ('pixels' in part ? { data: this.data(part.pixels, 'rgba8') } : part);
     if (texture.drawnAt === texture.version) {
       // The bytes of an upload are RGBA8, which an R8 or RG8 target does not hold.
       if (texture.format === GL2.R8 || texture.format === GL2.RG8) throw new WebGLUnsupportedError('texSubImage2D into an R8 or RG8 texture a framebuffer drew in; draw into it, or upload the whole texture again');
       this.begin();
-      this.ops.push({ op: 'upload', target: this.registerTarget(texture), x: xoffset, y: yoffset, width, height, ...json, ...flags });
+      this.ops.push({ op: 'upload', target: this.registerTarget(texture), x: xoffset, y: yoffset, width, height, ...json(), ...flags });
       return;
     }
     // Pixels over pixels held here, unflipped and premultiplied alike, are written in place.
@@ -2744,15 +2929,20 @@ export class WebGLContext {
       for (let y = 0; y < height; y += 1) {
         held.set(part.pixels.subarray(y * width * 4, (y + 1) * width * 4), ((yoffset + y) * texture.width + xoffset) * 4);
       }
+    } else if (xoffset === 0 && yoffset === 0 && width === texture.width && height === texture.height) {
+      // Over the whole texture (three.js fills a texStorage2D so), it is the texture's picture: nothing it held is left.
+      Object.assign(texture, { pixels: 'pixels' in part ? part.pixels : null, src: 'src' in part ? part.src : null, layer: 'layer' in part ? part.layer : null, flipY: this.flipY, premultiply: this.premultiply, patches: [] });
     } else {
-      texture.patches.push({ x: xoffset, y: yoffset, width, height, ...json, ...flags });
+      texture.patches.push({ x: xoffset, y: yoffset, width, height, ...json(), ...flags });
     }
     texture.blank = false;
     texture.version += 1;
   }
 
   /** WebGL 2's `texStorage2D`: a texture of this size, empty, with `levels` mip levels. */
-  texStorage2D(target: number, levels: number, internalformat: number, width: number, height: number): void {
+  texStorage2D(target: number, levelsArg: number, internalformat: number, widthArg: number, heightArg: number): void {
+    // GLsizei arguments, truncated to integers as a browser converts them: three.js passes `Math.log2(size) + 1` levels.
+    const [levels, width, height] = [levelsArg, widthArg, heightArg].map(Math.trunc) as [number, number, number];
     const texture = this.bound(target);
     if (texture === null) return;
     if (!(levels >= 1 && levels <= 16)) return this.fail(GL.INVALID_VALUE);
@@ -3020,6 +3210,7 @@ export class WebGLContext {
   /** A texture a framebuffer draws in, as the recording names it: its size, by an id that changes when it is specified again. */
   private registerTarget(texture: WebGLTexture): string {
     const id = `f${texture.id}.${texture.version}`;
+    this.targetsOwned.set(id, { owner: texture, version: texture.version, levels: Math.max(1, texture.levels) });
     const kind = kindOf(texture.format);
     this.textures.set(id, {
       target: true,
@@ -3042,6 +3233,7 @@ export class WebGLContext {
     }
     const r = a.renderbuffer;
     const id = `r${r.id}.${r.version}`;
+    this.targetsOwned.set(id, { owner: r, version: r.version, levels: 1 });
     const kind = kindOf(r.format ?? 0);
     const colorFormat = COLOR_TARGETS[r.format ?? 0];
     this.textures.set(id, { target: true, width: r.width, height: r.height, ...(kind === 'color' ? {} : { format: kind }), ...(colorFormat !== undefined ? { colorFormat } : {}), ...(r.samples > 0 ? { samples: r.samples } : {}) });
@@ -3379,12 +3571,29 @@ export class WebGLContext {
 
   private bufferId(buffer: WebGLBuffer): string {
     if (buffer.snapshot?.version !== buffer.version) {
-      const base64 = toBase64(buffer.data);
-      buffer.snapshot = { version: buffer.version, id: `b${hashOf(base64)}`, base64 };
+      const blob = this.blob(buffer.data);
+      buffer.snapshot = { version: buffer.version, id: `b${blob.slice(7, 23)}`, blob };
     }
-    const { id, base64 } = buffer.snapshot;
-    if (!this.buffers.has(id)) this.buffers.set(id, base64);
+    const { id, blob } = buffer.snapshot;
+    if (!this.buffers.has(id)) this.buffers.set(id, { blob });
     return id;
+  }
+
+  /** The sink this context's payloads go to, if any. */
+  private sink(): BlobSink | null {
+    return this.options.blobs ?? defaultSink;
+  }
+
+  /** These bytes as a blob: written once, named by their hash. */
+  private blob(bytes: Uint8Array): BlobRef {
+    const sink = this.sink();
+    if (sink === null) throw new Error('a WebGL recording keeps texture and buffer data in a blob directory, and none is set (setBlobSink)');
+    return sink.put(bytes);
+  }
+
+  /** A payload: its bytes as a blob, and how they are laid out. */
+  private data(bytes: Uint8Array, encoding: GlslData['encoding']): GlslData {
+    return { blob: this.blob(bytes), encoding };
   }
 
   /** The texture's state at this draw: its pixels (once, by id) and how this unit samples it. */
@@ -3434,7 +3643,7 @@ export class WebGLContext {
   private cubeJson(cube: WebGLTexture): GlslTexture {
     if (!this.cubeComplete(cube)) return { cube: true, faces: [] };
     const faces = cube.faces!.map((f) => ({
-      ...(f.src !== null ? { src: f.src } : { pixels: toBase64(f.pixels ?? new Uint8Array(0)) }),
+      ...(f.src !== null ? { src: f.src } : { data: this.data(f.pixels ?? new Uint8Array(0), 'rgba8') }),
       ...(f.flipY ? { flipY: true } : {}),
       ...(f.premultiply ? { premultiply: true } : {}),
     }));
@@ -3446,7 +3655,9 @@ export class WebGLContext {
     if (texture.snapshot?.version !== texture.version) {
       const json: GlslTexture = texture.faces !== null ? this.cubeJson(texture) : texture.depth > 0 || texture.floats !== null
         ? {
-            ...(texture.floats !== null ? { floats: toBase64(new Uint8Array(texture.floats.buffer, texture.floats.byteOffset, texture.floats.byteLength)), ...(texture.float32 ? { float32: true } : {}) } : { pixels: toBase64(texture.pixels ?? new Uint8Array(0)) }),
+            ...(texture.floats !== null
+              ? { data: this.data(new Uint8Array(texture.floats.buffer, texture.floats.byteOffset, texture.floats.byteLength), 'rgba-f32-le'), ...(texture.float32 ? { float32: true } : {}) }
+              : { data: this.data(texture.pixels ?? new Uint8Array(0), 'rgba8') }),
             width: texture.width,
             height: texture.height,
             ...(texture.depth > 0 ? { depth: texture.depth } : {}),
@@ -3457,7 +3668,7 @@ export class WebGLContext {
           ? { layer: texture.layer }
           : texture.src !== null
             ? { src: texture.src }
-            : { pixels: toBase64(texture.pixels ?? new Uint8Array(0)) }),
+            : { data: this.data(texture.pixels ?? new Uint8Array(0), 'rgba8') }),
         ...(texture.pixels !== null ? { width: texture.width, height: texture.height } : {}),
         ...(texture.flipY ? { flipY: true } : {}),
         ...(texture.premultiply ? { premultiply: true } : {}),

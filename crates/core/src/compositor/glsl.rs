@@ -27,14 +27,14 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 
-use base64::Engine as _;
 use kurbo::Point;
 
 use super::*;
 mod webgpu;
 
+use crate::blobs::{BlobRef, Blobs, ByteLru};
 use crate::glsl::{
-    self as gl, BlitAspect, GlslAttribute, GlslBlend, GlslBlit, GlslContent, GlslDraw, GlslMode,
+    self as gl, BlitAspect, Encoding, Files, GlslData, GlslAttribute, GlslBlend, GlslBlit, GlslContent, GlslDraw, GlslMode,
     GlslOp, GlslSampler, GlslStencilFace, GlslTexture, GlslType, Stage, TargetFormat, Translated,
 };
 
@@ -197,7 +197,10 @@ pub(super) struct GlslGpu {
     /// read depth textures, by the program and which.
     layouts: HashMap<String, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
     pipelines: HashMap<String, wgpu::RenderPipeline>,
-    textures: HashMap<String, Arc<Uploaded>>,
+    /// The textures and vertex buffers of recordings' payloads on the device (`Uploads`).
+    uploads: Uploads,
+    /// The bytes of the blobs read so far (`crate::blobs`).
+    blobs: Arc<Blobs>,
     samplers: HashMap<String, wgpu::Sampler>,
     target: Option<Target>,
     /// The multisampled drawing buffer of an `antialias` context, the size of `target`, which it resolves into.
@@ -225,6 +228,68 @@ pub(super) struct GlslGpu {
     webgpu: webgpu::WebGpuCache,
 }
 
+/// What the device holds of the payloads of recordings, shared by every recording a renderer draws: textures by their
+/// id and the stamps of the files they read (the id names the whole description, flags, patches and blobs included),
+/// and vertex buffers by their blob. Past the budget the least recently used go. Framebuffer targets are never here:
+/// each recording draws its own.
+struct Uploads(ByteLru<String, OnDevice>);
+
+enum OnDevice {
+    Texture(Arc<Uploaded>),
+    Buffer(wgpu::Buffer),
+}
+
+/// How many bytes of textures and buffers `Uploads` keeps on the device.
+const UPLOAD_BUDGET: u64 = 1 << 30;
+
+impl Default for Uploads {
+    fn default() -> Uploads {
+        Uploads(ByteLru::new(UPLOAD_BUDGET))
+    }
+}
+
+impl Uploads {
+    fn texture(&mut self, key: &String) -> Option<Arc<Uploaded>> {
+        match self.0.get(key)? {
+            OnDevice::Texture(t) => Some(t.clone()),
+            OnDevice::Buffer(_) => None,
+        }
+    }
+
+    /// Keeps `texture`, of `bytes` on the device.
+    fn keep_texture(&mut self, key: String, texture: Arc<Uploaded>, bytes: u64) {
+        self.0.insert(key, OnDevice::Texture(texture), bytes);
+    }
+
+    fn buffer(&mut self, blob: &BlobRef) -> Option<wgpu::Buffer> {
+        match self.0.get(&blob.to_string())? {
+            OnDevice::Buffer(b) => Some(b.clone()),
+            OnDevice::Texture(_) => None,
+        }
+    }
+
+    fn keep_buffer(&mut self, blob: &BlobRef, buffer: wgpu::Buffer) {
+        let bytes = buffer.size();
+        self.0.insert(blob.to_string(), OnDevice::Buffer(buffer), bytes);
+    }
+}
+
+/// The bytes of a texture of `layers` pictures of `width` x `height`, with its mip chain when it has more than one level.
+fn device_bytes(width: u32, height: u32, layers: u32, per_texel: u32, levels: u32) -> u64 {
+    let base = u64::from(width) * u64::from(height) * u64::from(layers) * u64::from(per_texel);
+    if levels > 1 { base / 3 * 4 } else { base }
+}
+
+/// A buffer a draw reads: its bytes, the blob they are (none for the values of a constant attribute, made for the
+/// recording) and the device buffer once one is made.
+struct Held {
+    bytes: Arc<[u8]>,
+    blob: Option<BlobRef>,
+    gpu: Option<wgpu::Buffer>,
+}
+
+type HeldBuffers<'c> = HashMap<&'c str, Held>;
+
 /// What a group's child is called among the pictures a pass samples: the way the texture reads it is part of the name.
 fn input_key(layer: &str, flip_y: bool, premultiply: bool) -> String {
     format!("{layer}\0{}{}", u8::from(flip_y), u8::from(premultiply))
@@ -240,16 +305,22 @@ fn render_error(what: impl std::fmt::Display) -> Error {
 
 /// The most a drawing buffer can be across.
 const MAX_BUFFER_SIDE: u32 = 8192;
-/// How many uploaded textures are kept before the least recently made go.
-const MAX_TEXTURES: usize = 64;
 /// The most the target textures of one layer may hold together.
 const MAX_TARGET_BYTES: u64 = 512 << 20;
 
 impl Compositor {
+    /// Keeps at most `bytes` of WebGL payloads read (blobs) and on the device (textures and vertex buffers), each
+    /// past the one used last; a new compositor keeps 512 MiB and 1 GiB. For tests of what a recording draws once
+    /// what an earlier one left is gone.
+    pub fn set_glsl_budget(&mut self, bytes: u64) {
+        self.glsl.uploads.0.set_budget(bytes);
+        self.glsl.blobs.set_budget(bytes);
+    }
+
     /// Runs the recording `content` into a `width` x `height` drawing buffer
     /// and places it on the canvas under `matrix` (layer space to texels of
     /// the padded canvas). `base_dir` is where a texture's `src` is read
-    /// from.
+    /// from, and the recording's `blobs` directory when it is relative.
     pub fn glsl(
         &mut self,
         content: &GlslContent,
@@ -531,6 +602,13 @@ impl Compositor {
         base_dir: &Path,
         inputs: &Inputs,
     ) -> Result<()> {
+        let blobs = self.glsl.blobs.clone();
+        let blob_dir = content.blobs.as_ref().map(|dir| base_dir.join(dir));
+        let files = Files {
+            base_dir,
+            blobs: blob_dir.as_deref(),
+            cache: &blobs,
+        };
         self.drawing_buffer(size, wgpu::TextureFormat::Rgba8Unorm);
         self.glsl.msaa_on = Self::glsl_multisampled(content);
         if self.glsl.msaa_on {
@@ -606,7 +684,7 @@ impl Compositor {
             (false, false) => None,
         };
 
-        let mut buffers: HashMap<&str, (Vec<u8>, Option<wgpu::Buffer>)> = HashMap::new();
+        let mut buffers: HeldBuffers = HashMap::new();
         let mut targets: HashMap<&str, Target> = HashMap::new();
         let mut steps: Vec<Step> = Vec::new();
         // The copies of depth targets draws sample, while what they hold is the target's.
@@ -627,7 +705,7 @@ impl Compositor {
                     ));
                 }
                 let size = t.size;
-                steps.push(Self::glsl_upload(&u.target, u, size, base_dir, inputs)?);
+                steps.push(Self::glsl_upload(&u.target, u, size, files, inputs)?);
                 continue;
             }
             // The attachments of the pass the op needs, and what it clears.
@@ -873,7 +951,7 @@ impl Compositor {
                         content,
                         draw,
                         size,
-                        (base_dir, inputs, &depth_copies, &cube_copies),
+                        (files, inputs, &depth_copies, &cube_copies),
                         &mut buffers,
                         &mut targets,
                         (&shape, ds_format, samples),
@@ -1344,13 +1422,13 @@ impl Compositor {
         content: &'c GlslContent,
         draw: &'c GlslDraw,
         size: (u32, u32),
-        (base_dir, inputs, depth_copies, cube_copies): (
-            &Path,
+        (files, inputs, depth_copies, cube_copies): (
+            Files<'_>,
             &Inputs,
             &HashMap<&str, wgpu::TextureView>,
             &HashMap<&str, wgpu::TextureView>,
         ),
-        buffers: &mut HashMap<&'c str, (Vec<u8>, Option<wgpu::Buffer>)>,
+        buffers: &mut HeldBuffers<'c>,
         targets: &mut HashMap<&'c str, Target>,
         (shape, ds, samples): (&[Option<wgpu::TextureFormat>], Option<TargetFormat>, u32),
     ) -> Result<Option<Prepared>> {
@@ -1410,7 +1488,7 @@ impl Compositor {
         let mut widens: Vec<Option<Widen>> = Vec::new();
         let last = match &draw.indices {
             Some(indices) => {
-                let max = self.glsl_max_index(content, indices, draw, buffers)?;
+                let max = self.glsl_max_index(content, indices, draw, buffers, files)?;
                 u64::from(max) + 1
             }
             None => u64::from(draw.first) + u64::from(draw.count),
@@ -1461,14 +1539,20 @@ impl Compositor {
                         ))
                     })?;
                 let copies: Vec<u8> = value.iter().flat_map(|c| c.to_le_bytes()).collect();
-                let held = buffers
-                    .entry(a.buffer.as_str())
-                    .or_insert_with(|| (Vec::new(), None));
-                if (held.0.len() as u64) < wanted {
-                    *held = (copies.repeat(last as usize), None);
+                let held = buffers.entry(a.buffer.as_str()).or_insert_with(|| Held {
+                    bytes: Arc::from(Vec::new()),
+                    blob: None,
+                    gpu: None,
+                });
+                if (held.bytes.len() as u64) < wanted {
+                    *held = Held {
+                        bytes: copies.repeat(last as usize).into(),
+                        blob: None,
+                        gpu: None,
+                    };
                 }
             }
-            let bytes = glsl_buffer(content, &a.buffer, buffers)?.len() as u64;
+            let bytes = glsl_buffer(content, &a.buffer, buffers, files)?.len() as u64;
             let reads = if per_instance {
                 u64::from(draw.instances.div_ceil(a.divisor))
             } else {
@@ -1515,7 +1599,7 @@ impl Compositor {
         // The index list, expanded to triangles when the mode needs it.
         let mut index_list: Option<Vec<u32>> = None;
         if let Some(indices) = &draw.indices {
-            let bytes = glsl_buffer(content, &indices.buffer, buffers)?;
+            let bytes = glsl_buffer(content, &indices.buffer, buffers, files)?;
             let list = read_indices(bytes, indices.ty, indices.offset, draw.count)?;
             index_list = Some(list);
         }
@@ -1527,7 +1611,7 @@ impl Compositor {
         // instance, instance `i` reading element `i / divisor`.
         for (k, divisor) in divided {
             let (buffer, stride, offset, element) = shapes[k];
-            let bytes = glsl_buffer(content, buffer, buffers)?;
+            let bytes = glsl_buffer(content, buffer, buffers, files)?;
             let mut out = Vec::with_capacity(draw.instances as usize * element as usize);
             for i in 0..u64::from(draw.instances) {
                 let at = (offset + i / u64::from(divisor) * stride) as usize;
@@ -1540,7 +1624,7 @@ impl Compositor {
         }
         if points && let Some(list) = index_list.take() {
             for (k, (buffer, stride, offset, element)) in shapes.iter().enumerate() {
-                let bytes = glsl_buffer(content, buffer, buffers)?;
+                let bytes = glsl_buffer(content, buffer, buffers, files)?;
                 let mut out = Vec::with_capacity(list.len() * *element as usize);
                 for index in &list {
                     let at = (offset + u64::from(*index) * stride) as usize;
@@ -1561,7 +1645,7 @@ impl Compositor {
             let out = match gathered[k].take() {
                 Some(raw) => widen_values(&raw, (0, element, raw.len() as u64 / element), widen)?,
                 None => {
-                    let bytes = glsl_buffer(content, buffer, buffers)?;
+                    let bytes = glsl_buffer(content, buffer, buffers, files)?;
                     widen_values(bytes, (offset, stride, widen.count), widen)?
                 }
             };
@@ -1659,13 +1743,21 @@ impl Compositor {
                             float32: is_float32(face.format),
                         })
                     } else if texture.cube {
-                        self.glsl_cube(&state.texture, texture, base_dir)?
-                    } else if texture.depth > 0 || texture.floats.is_some() {
-                        self.glsl_texture_texels(&state.texture, texture)?
+                        self.glsl_cube(&state.texture, texture, files)?
+                    } else if texture.depth > 0
+                        || matches!(
+                            texture.data,
+                            Some(GlslData {
+                                encoding: Encoding::RgbaF32Le,
+                                ..
+                            })
+                        )
+                    {
+                        self.glsl_texture_texels(&state.texture, texture, files)?
                     } else if texture.layer.is_some()
                         || texture.patches.iter().any(|p| p.layer.is_some())
                     {
-                        self.glsl_composed(&state.texture, texture, base_dir, inputs)?
+                        self.glsl_composed(&state.texture, texture, files, inputs)?
                     } else if texture.target {
                         let drawn_into = colors
                             .iter()
@@ -1700,7 +1792,7 @@ impl Compositor {
                             float32: texture.color_format.is_some_and(gl::ColorFormat::is_32),
                         })
                     } else {
-                        self.glsl_texture(&state.texture, texture, base_dir)?
+                        self.glsl_texture(&state.texture, texture, files)?
                     };
                     Some((state, uploaded))
                 }
@@ -1832,14 +1924,24 @@ impl Compositor {
                 continue;
             }
             let entry = buffers.get_mut(buffer).expect("read above");
-            let gpu = entry.1.get_or_insert_with(|| {
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("glsl vertices"),
-                        contents: &entry.0,
-                        usage: wgpu::BufferUsages::VERTEX,
-                    })
-            });
+            // A blob's buffer is made once for every recording that reads it; a constant attribute's, for this one.
+            if entry.gpu.is_none() {
+                let kept = entry.blob.and_then(|blob| self.glsl.uploads.buffer(&blob));
+                entry.gpu = Some(kept.unwrap_or_else(|| {
+                    let made = self
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("glsl vertices"),
+                            contents: &entry.bytes,
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                    if let Some(blob) = &entry.blob {
+                        self.glsl.uploads.keep_buffer(blob, made.clone());
+                    }
+                    made
+                }));
+            }
+            let gpu = entry.gpu.as_ref().expect("made above");
             vertex_buffers.push((gpu.clone(), offset));
         }
         let indices = index_list.map(|list| {
@@ -1897,9 +1999,10 @@ impl Compositor {
         content: &'c GlslContent,
         indices: &'c gl::GlslIndices,
         draw: &GlslDraw,
-        buffers: &mut HashMap<&'c str, (Vec<u8>, Option<wgpu::Buffer>)>,
+        buffers: &mut HeldBuffers<'c>,
+        files: Files<'_>,
     ) -> Result<u32> {
-        let bytes = glsl_buffer(content, &indices.buffer, buffers)?;
+        let bytes = glsl_buffer(content, &indices.buffer, buffers, files)?;
         let list = read_indices(bytes, indices.ty, indices.offset, draw.count)?;
         Ok(list.into_iter().max().unwrap_or(0))
     }
@@ -2237,12 +2340,12 @@ impl Compositor {
         &mut self,
         id: &str,
         texture: &GlslTexture,
-        base_dir: &Path,
+        files: Files<'_>,
     ) -> Result<Arc<Uploaded>> {
         // An edited file is read again, also one a patch laid over the texture.
         let stamp_of = |src: Option<&str>| {
             src.filter(|s| !s.starts_with("data:"))
-                .map(|s| file_stamp(&base_dir.join(s)))
+                .map(|s| file_stamp(&files.base_dir.join(s)))
                 .unwrap_or_default()
         };
         let mut stamp = stamp_of(texture.src.as_deref());
@@ -2254,19 +2357,19 @@ impl Compositor {
             "{id}|{}|{}|{}|{}|{stamp}",
             texture.flip_y, texture.premultiply, texture.mipmaps, texture.srgb
         );
-        if let Some(t) = self.glsl.textures.get(&key) {
-            return Ok(t.clone());
+        if let Some(t) = self.glsl.uploads.texture(&key) {
+            return Ok(t);
         }
         let (mut rgba, width, height) =
-            gl::decode_texture(texture, base_dir).map_err(render_error)?;
+            gl::decode_texture(texture, files).map_err(render_error)?;
         gl::unpack(&mut rgba, width, texture.flip_y, texture.premultiply);
         // `texSubImage2D` of pictures over it, in order.
         for patch in &texture.patches {
             let (mut part, w, h) = gl::decode_picture(
                 patch.src.as_deref(),
-                patch.pixels.as_deref(),
+                patch.data.as_ref(),
                 (patch.width, patch.height),
-                base_dir,
+                files,
             )
             .map_err(render_error)?;
             if (w, h) != (patch.width, patch.height)
@@ -2339,16 +2442,15 @@ impl Compositor {
                 (level, w, h) = gl::next_level(&level, w, h);
             }
         }
-        if self.glsl.textures.len() >= MAX_TEXTURES {
-            self.glsl.textures.clear();
-        }
         let uploaded = Arc::new(Uploaded {
             view: gpu.create_view(&wgpu::TextureViewDescriptor::default()),
             mipmapped: levels > 1,
             depth: false,
             float32: false,
         });
-        self.glsl.textures.insert(key, uploaded.clone());
+        self.glsl
+            .uploads
+            .keep_texture(key, uploaded.clone(), device_bytes(width, height, 1, 4, levels));
         Ok(uploaded)
     }
 
@@ -2358,21 +2460,21 @@ impl Compositor {
         &mut self,
         id: &str,
         texture: &GlslTexture,
-        base_dir: &Path,
+        files: Files<'_>,
     ) -> Result<Arc<Uploaded>> {
         let stamp: String = texture
             .faces
             .iter()
             .filter_map(|f| f.src.as_deref())
             .filter(|s| !s.starts_with("data:"))
-            .map(|s| file_stamp(&base_dir.join(s)))
+            .map(|s| file_stamp(&files.base_dir.join(s)))
             .collect::<Vec<_>>()
             .join("|");
         let key = format!("{id}|cube|{}|{}|{stamp}", texture.mipmaps, texture.srgb);
-        if let Some(t) = self.glsl.textures.get(&key) {
-            return Ok(t.clone());
+        if let Some(t) = self.glsl.uploads.texture(&key) {
+            return Ok(t);
         }
-        let Some((faces, side)) = gl::decode_cube(texture, base_dir).map_err(render_error)? else {
+        let Some((faces, side)) = gl::decode_cube(texture, files).map_err(render_error)? else {
             return Ok(self.glsl_black(gl::SamplerDim::Cube));
         };
         let limit = self.device.limits().max_texture_dimension_2d;
@@ -2431,9 +2533,6 @@ impl Compositor {
                 }
             }
         }
-        if self.glsl.textures.len() >= MAX_TEXTURES {
-            self.glsl.textures.clear();
-        }
         let uploaded = Arc::new(Uploaded {
             view: gpu.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(wgpu::TextureViewDimension::Cube),
@@ -2443,18 +2542,25 @@ impl Compositor {
             depth: false,
             float32: false,
         });
-        self.glsl.textures.insert(key, uploaded.clone());
+        self.glsl
+            .uploads
+            .keep_texture(key, uploaded.clone(), device_bytes(side, side, 6, 4, levels));
         Ok(uploaded)
     }
 
     /// A 3D texture (`texImage3D`) or a float one (`R32F`, `RGBA16F`, ...), uploaded the first time and kept by
     /// what it is made from.
-    fn glsl_texture_texels(&mut self, id: &str, texture: &GlslTexture) -> Result<Arc<Uploaded>> {
+    fn glsl_texture_texels(
+        &mut self,
+        id: &str,
+        texture: &GlslTexture,
+        files: Files<'_>,
+    ) -> Result<Arc<Uploaded>> {
         let key = format!("{id}|texels");
-        if let Some(t) = self.glsl.textures.get(&key) {
-            return Ok(t.clone());
+        if let Some(t) = self.glsl.uploads.texture(&key) {
+            return Ok(t);
         }
-        let texels = gl::decode_texels(texture).map_err(render_error)?;
+        let texels = gl::decode_texels(texture, files).map_err(render_error)?;
         let three_d = texture.depth > 0 && !texture.array;
         let limits = self.device.limits();
         let limit = if three_d {
@@ -2507,9 +2613,6 @@ impl Compositor {
             },
             size,
         );
-        if self.glsl.textures.len() >= MAX_TEXTURES {
-            self.glsl.textures.clear();
-        }
         let uploaded = Arc::new(Uploaded {
             view: gpu.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(view_dimension(texture_dim(texture))),
@@ -2519,7 +2622,11 @@ impl Compositor {
             depth: false,
             float32: matches!(texels, gl::Texels::Rgba32F(_)),
         });
-        self.glsl.textures.insert(key, uploaded.clone());
+        self.glsl.uploads.keep_texture(
+            key,
+            uploaded.clone(),
+            device_bytes(width, height, depth, per_texel, 1),
+        );
         Ok(uploaded)
     }
 
@@ -2530,7 +2637,7 @@ impl Compositor {
         &mut self,
         id: &str,
         texture: &GlslTexture,
-        base_dir: &Path,
+        files: Files<'_>,
         inputs: &Inputs,
     ) -> Result<Arc<Uploaded>> {
         if texture.srgb {
@@ -2566,7 +2673,7 @@ impl Compositor {
         let part = |this: &Self,
                     layer: Option<&str>,
                     src: Option<&str>,
-                    pixels: Option<&str>,
+                    data: Option<&GlslData>,
                     (flip_y, premultiply): (bool, bool),
                     size: (u32, u32)|
          -> Result<wgpu::Texture> {
@@ -2574,7 +2681,7 @@ impl Compositor {
                 return Ok(input(layer, flip_y, premultiply)?.1.clone());
             }
             let (mut rgba, w, h) =
-                gl::decode_picture(src, pixels, size, base_dir).map_err(render_error)?;
+                gl::decode_picture(src, data, size, files).map_err(render_error)?;
             gl::unpack(&mut rgba, w, flip_y, premultiply);
             Ok(this.device.create_texture_with_data(
                 &this.queue,
@@ -2600,7 +2707,7 @@ impl Compositor {
             self,
             texture.layer.as_deref(),
             texture.src.as_deref(),
-            texture.pixels.as_deref(),
+            texture.data.as_ref(),
             (texture.flip_y, texture.premultiply),
             (texture.width, texture.height),
         )?;
@@ -2625,7 +2732,7 @@ impl Compositor {
                 self,
                 p.layer.as_deref(),
                 p.src.as_deref(),
-                p.pixels.as_deref(),
+                p.data.as_ref(),
                 (p.flip_y, p.premultiply),
                 (p.width, p.height),
             )?;
@@ -2977,7 +3084,7 @@ impl Compositor {
         target: &'c str,
         upload: &gl::GlslUpload,
         size: (u32, u32),
-        base_dir: &Path,
+        files: Files<'_>,
         inputs: &Inputs,
     ) -> Result<Step<'c>> {
         let (w, h) = (upload.width, upload.height);
@@ -3008,9 +3115,9 @@ impl Compositor {
         }
         let (mut rgba, pw, ph) = gl::decode_picture(
             upload.src.as_deref(),
-            upload.pixels.as_deref(),
+            upload.data.as_ref(),
             (w, h),
-            base_dir,
+            files,
         )
         .map_err(|e| render_error(format!("a texSubImage2D: {e}")))?;
         if (pw, ph) != (w, h) {
@@ -3836,23 +3943,31 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
     }
 }
 
-/// The bytes of a recorded buffer, decoded the first time a draw reads it.
+/// The bytes of a recorded buffer, read the first time a draw reads it.
 fn glsl_buffer<'a, 'c>(
     content: &'c GlslContent,
     id: &'c str,
-    buffers: &'a mut HashMap<&'c str, (Vec<u8>, Option<wgpu::Buffer>)>,
+    buffers: &'a mut HeldBuffers<'c>,
+    files: Files<'_>,
 ) -> Result<&'a [u8]> {
     if !buffers.contains_key(id) {
-        let encoded = content
+        let buffer = content
             .buffers
             .get(id)
             .ok_or_else(|| render_error(format!("the buffer {id:?} is not in the recording")))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|e| render_error(format!("the buffer {id:?} is not base64: {e}")))?;
-        buffers.insert(id, (bytes, None));
+        let bytes = files
+            .read(&buffer.blob)
+            .map_err(|e| render_error(format!("the buffer {id:?}: {e}")))?;
+        buffers.insert(
+            id,
+            Held {
+                bytes,
+                blob: Some(buffer.blob),
+                gpu: None,
+            },
+        );
     }
-    Ok(&buffers[id].0)
+    Ok(&buffers[id].bytes)
 }
 
 fn read_indices(bytes: &[u8], ty: GlslType, offset: u32, count: u32) -> Result<Vec<u32>> {

@@ -26,6 +26,7 @@ use naga::ShaderStage;
 use naga::front::glsl::{Frontend, Options};
 use serde::Deserialize;
 
+pub use crate::blobs::{BlobRef, Files};
 use crate::error::{Error, Result};
 use crate::glsl_cpp::Cpp;
 use crate::glsl_samplers::{expand_sampler_arrays, finish as finish_samplers, lower_sampler_parameters};
@@ -80,9 +81,13 @@ pub struct GlslContent {
     /// By id.
     #[serde(default)]
     pub programs: BTreeMap<String, GlslProgram>,
-    /// Base64 bytes, by id.
+    /// The blob directory the payloads are files of (`crate::blobs`), relative to the scene's directory unless
+    /// absolute.
     #[serde(default)]
-    pub buffers: BTreeMap<String, String>,
+    pub blobs: Option<std::path::PathBuf>,
+    /// By id.
+    #[serde(default)]
+    pub buffers: BTreeMap<String, GlslBuffer>,
     #[serde(default)]
     pub textures: BTreeMap<String, GlslTexture>,
     #[serde(default)]
@@ -90,6 +95,31 @@ pub struct GlslContent {
     /// What a WebGPU context drew (`crate::webgpu`); the fields above are empty then.
     #[serde(default)]
     pub webgpu: Option<crate::webgpu::WebGpuContent>,
+}
+
+/// A payload: a blob and how its bytes are laid out. The description beside it (the size, `float32`, depth, patches)
+/// says what they are of.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlslData {
+    pub blob: BlobRef,
+    pub encoding: Encoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Encoding {
+    /// Four bytes a texel, straight alpha.
+    Rgba8,
+    /// Four little-endian `f32`s a texel.
+    RgbaF32Le,
+}
+
+/// A buffer's bytes.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlslBuffer {
+    pub blob: BlobRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -103,7 +133,7 @@ pub struct GlslProgram {
     pub attributes: BTreeMap<String, u32>,
 }
 
-/// A texture's pixels: a picture file, or RGBA bytes. The sampling state is
+/// A texture's pixels: a picture file, or a payload. The sampling state is
 /// the draw's (`GlslSampler`).
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -111,8 +141,9 @@ pub struct GlslTexture {
     /// A picture file relative to the scene, or a `data:` URL; its pixels are
     /// straight RGBA8 as the decoder gives them.
     pub src: Option<String>,
-    /// Base64 RGBA8, straight alpha, `width * height * 4` bytes.
-    pub pixels: Option<String>,
+    /// RGBA8 (`width * height * 4` bytes, or `* depth` of a 3D one), or with `rgba-f32-le` floats (16 bytes a texel),
+    /// kept as half floats, or in full with `float32`.
+    pub data: Option<GlslData>,
     /// The `id` of a child of the group this recording belongs to
     /// (`GroupLayer::glsl`): the picture is that child, drawn, as the
     /// drawing buffer's size and place would show it.
@@ -131,7 +162,7 @@ pub struct GlslTexture {
     #[serde(default)]
     pub mipmaps: bool,
     /// A render target (a framebuffer's texture or renderbuffer): `width` x
-    /// `height`, empty, with no `src` or `pixels`. The ops that name it draw
+    /// `height`, empty, with no `src` or `data`. The ops that name it draw
     /// into it, and later draws sample what they left.
     #[serde(default)]
     pub target: bool,
@@ -157,16 +188,13 @@ pub struct GlslTexture {
     #[serde(default)]
     pub patches: Vec<GlslPatch>,
     /// A 3D texture (`texImage3D`): the number of layers it is `width` x `height`; 0 for a 2D one. Its
-    /// texels are `pixels` (RGBA8, `width * height * depth * 4` bytes, x fastest, then y, then z) or `floats`.
+    /// texels are `data`, x fastest, then y, then z.
     #[serde(default)]
     pub depth: u32,
     /// With `depth`: a 2D array texture (`TEXTURE_2D_ARRAY`, read by a `sampler2DArray`) of `depth` layers, not a
     /// 3D texture.
     #[serde(default)]
     pub array: bool,
-    /// A float texture, 2D or 3D (`R32F`, `RGBA16F`, ...): base64 little-endian `f32`s, four for each texel,
-    /// kept as half floats, or in full with `float32`.
-    pub floats: Option<String>,
     /// The floats are of a 32-bit format: they are kept in full, and a browser filters them with `NEAREST` only.
     #[serde(default)]
     pub float32: bool,
@@ -187,7 +215,7 @@ pub struct GlslTexture {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GlslFace {
     pub src: Option<String>,
-    pub pixels: Option<String>,
+    pub data: Option<GlslData>,
     #[serde(default)]
     pub flip_y: bool,
     #[serde(default)]
@@ -259,10 +287,10 @@ pub struct GlslPatch {
     pub y: u32,
     pub width: u32,
     pub height: u32,
-    /// One of these: a picture file (or `data:` URL), base64 RGBA8 (straight
+    /// One of these: a picture file (or `data:` URL), RGBA8 `data` (straight
     /// alpha), or a child of the shader group.
     pub src: Option<String>,
-    pub pixels: Option<String>,
+    pub data: Option<GlslData>,
     pub layer: Option<String>,
     #[serde(default)]
     pub flip_y: bool,
@@ -374,9 +402,9 @@ pub struct GlslUpload {
     pub y: u32,
     pub width: u32,
     pub height: u32,
-    /// One of these: base64 RGBA8 (straight alpha, `width * height * 4`
+    /// One of these: RGBA8 `data` (straight alpha, `width * height * 4`
     /// bytes), a picture file, or a child of the shader group.
-    pub pixels: Option<String>,
+    pub data: Option<GlslData>,
     pub src: Option<String>,
     pub layer: Option<String>,
     /// `UNPACK_FLIP_Y_WEBGL` was set.
@@ -2659,56 +2687,74 @@ fn write_member(
 /// the bytes it was given.
 pub fn decode_texture(
     texture: &GlslTexture,
-    base_dir: &std::path::Path,
+    files: Files<'_>,
 ) -> std::result::Result<(Vec<u8>, u32, u32), String> {
-    if texture.src.is_none() && texture.pixels.is_none() {
-        return Err("a texture has either a src or pixels (or, in a group, a layer)".into());
+    if texture.src.is_none() && texture.data.is_none() {
+        return Err("a texture has either a src or data (or, in a group, a layer)".into());
     }
     decode_picture(
         texture.src.as_deref(),
-        texture.pixels.as_deref(),
+        texture.data.as_ref(),
         (texture.width, texture.height),
-        base_dir,
+        files,
     )
 }
 
-/// The straight RGBA8 pixels and size of a picture file (or `data:` URL)
-/// `src`, or of the base64 bytes `pixels` of a picture of `size`.
-pub fn decode_picture(
-    src: Option<&str>,
-    pixels: Option<&str>,
-    (w, h): (u32, u32),
+/// The bytes of a payload: its blob, which must be of `encoding`.
+pub fn payload(
+    data: &GlslData,
+    encoding: Encoding,
+    files: Files<'_>,
+) -> std::result::Result<Arc<[u8]>, String> {
+    if data.encoding != encoding {
+        return Err(format!(
+            "the blob {} is {:?} where {encoding:?} is read",
+            data.blob, data.encoding
+        ));
+    }
+    files.read(&data.blob)
+}
+
+/// The straight RGBA8 pixels and size of the picture file (or `data:` URL) `src`, relative to `base_dir`.
+pub fn decode_src(
+    src: &str,
     base_dir: &std::path::Path,
 ) -> std::result::Result<(Vec<u8>, u32, u32), String> {
-    use base64::Engine as _;
-    match (src, pixels) {
-        (Some(src), None) => {
-            let decoded = if let Some(bytes) = crate::scene::data_uri_bytes(src) {
-                image::load_from_memory(&bytes)
-                    .map_err(|e| format!("cannot decode a data: texture: {e}"))?
-            } else {
-                let path = base_dir.join(src);
-                image::open(&path)
-                    .map_err(|e| format!("cannot decode the texture {}: {e}", path.display()))?
-            }
-            .to_rgba8();
-            let (w, h) = decoded.dimensions();
-            Ok((decoded.into_raw(), w, h))
-        }
-        (None, Some(pixels)) => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(pixels)
-                .map_err(|e| format!("a texture's pixels are not base64: {e}"))?;
+    let decoded = if let Some(bytes) = crate::scene::data_uri_bytes(src) {
+        image::load_from_memory(&bytes).map_err(|e| format!("cannot decode a data: texture: {e}"))?
+    } else {
+        let path = base_dir.join(src);
+        image::open(&path)
+            .map_err(|e| format!("cannot decode the texture {}: {e}", path.display()))?
+    }
+    .to_rgba8();
+    let (w, h) = decoded.dimensions();
+    Ok((decoded.into_raw(), w, h))
+}
+
+/// The straight RGBA8 pixels and size of a picture file (or `data:` URL)
+/// `src`, or of the RGBA8 payload `data` of a picture of `size`.
+pub fn decode_picture(
+    src: Option<&str>,
+    data: Option<&GlslData>,
+    (w, h): (u32, u32),
+    files: Files<'_>,
+) -> std::result::Result<(Vec<u8>, u32, u32), String> {
+    match (src, data) {
+        (Some(src), None) => decode_src(src, files.base_dir),
+        (None, Some(data)) => {
+            let bytes = payload(data, Encoding::Rgba8, files)?;
             if w == 0 || h == 0 || bytes.len() != w as usize * h as usize * 4 {
                 return Err(format!(
-                    "a texture of {w} x {h} needs {} bytes of RGBA, got {}",
+                    "a texture of {w} x {h} needs {} bytes of RGBA, the blob {} holds {}",
                     w as usize * h as usize * 4,
+                    data.blob,
                     bytes.len()
                 ));
             }
-            Ok((bytes, w, h))
+            Ok((bytes.to_vec(), w, h))
         }
-        _ => Err("a picture has either a src or pixels".into()),
+        _ => Err("a picture has either a src or data".into()),
     }
 }
 
@@ -2716,7 +2762,7 @@ pub fn decode_picture(
 /// incomplete cube (no faces) is `None`: it samples as opaque black.
 pub fn decode_cube(
     texture: &GlslTexture,
-    base_dir: &std::path::Path,
+    files: Files<'_>,
 ) -> std::result::Result<Option<(Vec<Vec<u8>>, u32)>, String> {
     if texture.faces.is_empty() {
         return Ok(None);
@@ -2732,9 +2778,9 @@ pub fn decode_cube(
     for (i, face) in texture.faces.iter().enumerate() {
         let (mut rgba, w, h) = decode_picture(
             face.src.as_deref(),
-            face.pixels.as_deref(),
+            face.data.as_ref(),
             (side, side),
-            base_dir,
+            files,
         )
         .map_err(|e| format!("cube map face {i}: {e}"))?;
         if w != side || h != side || side == 0 {
@@ -2759,10 +2805,9 @@ pub enum Texels {
     Rgba32F(Vec<u8>),
 }
 
-/// The texels of a texture with `floats` or a 3D texture: its `pixels`, or its `floats` rounded to half
-/// floats (kept in full with `float32`), as `texImage2D` and `texImage3D` of a float format do.
-pub fn decode_texels(texture: &GlslTexture) -> std::result::Result<Texels, String> {
-    use base64::Engine as _;
+/// The texels of a float or 3D texture: its RGBA8 `data`, or its `rgba-f32-le` `data` rounded to half floats (kept in
+/// full with `float32`), as `texImage2D` and `texImage3D` of a float format do.
+pub fn decode_texels(texture: &GlslTexture, files: Files<'_>) -> std::result::Result<Texels, String> {
     let (w, h, d) = (
         texture.width as usize,
         texture.height as usize,
@@ -2772,45 +2817,29 @@ pub fn decode_texels(texture: &GlslTexture) -> std::result::Result<Texels, Strin
         return Err(format!("a texture of {w} x {h} x {d} has no texels"));
     }
     let texels = w * h * d;
-    let decode = |data: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| format!("a 3D texture's texels are not base64: {e}"))
+    let data = texture.data.as_ref().ok_or("a float or 3D texture has data")?;
+    let bytes = files.read(&data.blob)?;
+    let (per, what) = match data.encoding {
+        Encoding::Rgba8 => (4, "RGBA"),
+        Encoding::RgbaF32Le => (16, "RGBA floats"),
     };
-    match (&texture.pixels, &texture.floats) {
-        (Some(pixels), None) => {
-            let bytes = decode(pixels)?;
-            if bytes.len() != texels * 4 {
-                return Err(format!(
-                    "a texture of {w} x {h} x {d} needs {} bytes of RGBA, got {}",
-                    texels * 4,
-                    bytes.len()
-                ));
-            }
-            Ok(Texels::Rgba8(bytes))
-        }
-        (None, Some(floats)) => {
-            let bytes = decode(floats)?;
-            if bytes.len() != texels * 16 {
-                return Err(format!(
-                    "a texture of {w} x {h} x {d} needs {} bytes of RGBA floats, got {}",
-                    texels * 16,
-                    bytes.len()
-                ));
-            }
-            if texture.float32 {
-                return Ok(Texels::Rgba32F(bytes));
-            }
-            let halves = bytes
+    if bytes.len() != texels * per {
+        return Err(format!(
+            "a texture of {w} x {h} x {d} needs {} bytes of {what}, the blob {} holds {}",
+            texels * per,
+            data.blob,
+            bytes.len()
+        ));
+    }
+    match data.encoding {
+        Encoding::Rgba8 => Ok(Texels::Rgba8(bytes.to_vec())),
+        Encoding::RgbaF32Le if texture.float32 => Ok(Texels::Rgba32F(bytes.to_vec())),
+        Encoding::RgbaF32Le => Ok(Texels::Rgba16F(
+            bytes
                 .chunks_exact(4)
-                .flat_map(|f| {
-                    let v = f32::from_le_bytes([f[0], f[1], f[2], f[3]]);
-                    f32_to_f16(v).to_le_bytes()
-                })
-                .collect();
-            Ok(Texels::Rgba16F(halves))
-        }
-        _ => Err("a texture has either pixels or floats".into()),
+                .flat_map(|f| f32_to_f16(f32::from_le_bytes([f[0], f[1], f[2], f[3]])).to_le_bytes())
+                .collect(),
+        )),
     }
 }
 
@@ -3477,11 +3506,21 @@ mod tests {
 
     #[test]
     fn a_3d_texture_decodes_its_pixels_or_its_floats() {
-        use base64::Engine as _;
-        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-        let texture = |pixels: Option<String>, floats: Option<String>| GlslTexture {
+        let dir = std::env::temp_dir().join(format!("kinetograph-texels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = crate::blobs::Blobs::default();
+        let files = Files { base_dir: &dir, blobs: Some(&dir), cache: &cache };
+        // Blobs are named by any 64 hex digits here: the reader does not hash what it reads.
+        let mut n = 0u8;
+        let mut put = |bytes: &[u8], encoding: Encoding| {
+            n += 1;
+            let blob = BlobRef::parse(&format!("sha256:{n:064x}")).unwrap();
+            std::fs::write(dir.join(blob.file_name()), bytes).unwrap();
+            Some(GlslData { blob, encoding })
+        };
+        let texture = |data: Option<GlslData>| GlslTexture {
             src: None,
-            pixels,
+            data,
             layer: None,
             width: 2,
             height: 1,
@@ -3498,27 +3537,28 @@ mod tests {
             array: false,
             color_format: None,
             srgb: false,
-            floats,
             float32: false,
             cube: false,
             faces: Vec::new(),
             targets: Vec::new(),
         };
-        let rgba8 = decode_texels(&texture(Some(b64(&[7; 16])), None)).unwrap();
+        let rgba8 = decode_texels(&texture(put(&[7; 16], Encoding::Rgba8)), files).unwrap();
         assert_eq!(rgba8, Texels::Rgba8(vec![7; 16]));
         let floats: Vec<u8> = (0..16).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        let Texels::Rgba16F(halves) = decode_texels(&texture(None, Some(b64(&floats)))).unwrap()
+        let Texels::Rgba16F(halves) =
+            decode_texels(&texture(put(&floats, Encoding::RgbaF32Le)), files).unwrap()
         else {
             panic!("half floats");
         };
         assert_eq!(halves.len(), 32);
         assert_eq!(&halves[..2], &0x3c00u16.to_le_bytes());
         // A 2D texture of 32-bit floats is kept in full.
-        let mut full = texture(None, Some(b64(&floats[..32])));
+        let mut full = texture(put(&floats[..32], Encoding::RgbaF32Le));
         (full.depth, full.float32) = (0, true);
-        assert_eq!(decode_texels(&full).unwrap(), Texels::Rgba32F(floats[..32].to_vec()));
-        let e = decode_texels(&texture(Some(b64(&[0; 15])), None)).unwrap_err();
+        assert_eq!(decode_texels(&full, files).unwrap(), Texels::Rgba32F(floats[..32].to_vec()));
+        let e = decode_texels(&texture(put(&[0; 15], Encoding::Rgba8)), files).unwrap_err();
         assert!(e.contains("needs 16 bytes"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
