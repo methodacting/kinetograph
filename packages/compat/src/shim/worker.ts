@@ -65,6 +65,11 @@ async function turn(): Promise<void> {
 }
 
 /** Resolves when no message is queued and no worker fetch is out (immediately when none is). */
+/** Whether messages are queued or being delivered (a worker's, a MessageChannel's): the page is still moving. */
+export function messagesInFlight(): boolean {
+  return pumping;
+}
+
 export function whenWorkersIdle(): Promise<void> {
   return pumping ? new Promise<void>((resolve) => idleWaiters.push(resolve)) : Promise.resolve();
 }
